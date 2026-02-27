@@ -60,6 +60,7 @@ python main.py
 - После wake word ассистент говорит «Слушаю», записывает команду с микрофона (до тишины или max 10s) и отправляет её в стандартный текстовый pipeline.
 - При включении Voice режима выполняется короткий TTS self-test: «Голосовой режим включен».
 - Ответ появляется в чате и озвучивается через `Piper` (dedicated TTS-thread + очередь сообщений, без блокировки UI).
+- Piper запускается только в режиме RAW STREAM: текст передаётся в `stdin`, PCM 16-bit (`--output_raw`) читается из `stdout` и воспроизводится через `sounddevice`.
 - Если ассистент уже выполняет задачу, на wake word он отвечает «Подожди секунду».
 - Кнопка `STOP` останавливает текущий pipeline, voice-listening, текущую запись/транскрипцию и мгновенно прерывает текущую озвучку (`sounddevice.stop()` + очистка очереди TTS).
 - В UI есть слайдер `TTS Volume` (0..100), который применяется сразу.
@@ -81,7 +82,7 @@ python main.py
 - `JARVIS_WHISPER_BEAM_SIZE` (default `1`, диапазон `1..3`)
 - `JARVIS_TTS_BACKEND` (default `piper`)
 - `JARVIS_PIPER_MODEL_PATH` (обязательно: путь к `*.onnx` модели Piper)
-- `JARVIS_PIPER_EXE_PATH` (optional: путь к `piper.exe` для subprocess fallback)
+- `JARVIS_PIPER_EXE_PATH` (обязательно: полный путь к `piper.exe`, TTS работает только через RAW STREAM subprocess)
 - `JARVIS_TTS_VOLUME` (default `80`; можно задавать как `0..1` или `0..100`)
 - `JARVIS_TTS_RATE` (optional, default `1.0`)
 
@@ -117,10 +118,11 @@ setx JARVIS_PORCUPINE_SENSITIVITY "0.85"
 ### Быстрая настройка Piper (Windows)
 
 1. Скачай оффлайн voice model Piper (`.onnx`) из официального списка голосов Piper (например, ru_RU voice) и положи в локальную папку, например `C:\jarvis\models\piper`.
-2. Установи переменную окружения:
+2. Установи переменные окружения:
 
 ```bash
 setx JARVIS_PIPER_MODEL_PATH "C:\jarvis\models\piper\ru_RU-....onnx"
+setx JARVIS_PIPER_EXE_PATH "C:\jarvis\tools\piper\piper.exe"
 ```
 
 3. Запусти приложение:

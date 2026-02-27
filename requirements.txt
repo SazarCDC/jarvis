@@ -10,4 +10,3 @@ sounddevice>=0.4.6
 faster-whisper>=1.0.0
 pvporcupine>=3.0.2
 pvrecorder>=1.2.4
-piper-tts>=1.2.0
