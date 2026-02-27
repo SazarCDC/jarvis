@@ -100,7 +100,7 @@ class JarvisApp(tk.Tk):
         self.voice_controller.start()
         self._append(
             "System",
-            "Voice mode включен (offline): wake=openWakeWord (onnx), stt=faster-whisper",
+            "Voice mode включен (offline): wake=Vosk(джарвис), stt=faster-whisper",
         )
 
     def on_stop(self) -> None:

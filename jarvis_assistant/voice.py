@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
 import threading
 import time
-import urllib.request
-from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 
 import numpy as np
 
@@ -15,53 +14,11 @@ from jarvis_assistant.assistant_core import JarvisAssistant
 from jarvis_assistant.logger import JsonlLogger
 
 
-class VadBackend(Protocol):
-    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool: ...
-
-
-class LiteVadBackend:
-    def __init__(self, rms_threshold: float) -> None:
-        self.rms_threshold = max(1.0, float(rms_threshold))
-
-    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool:
-        del sample_rate
-        audio = np.frombuffer(pcm16, dtype=np.int16)
-        if audio.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32)))))
-        return rms >= self.rms_threshold
-
-
-class SileroVadBackend:
-    def __init__(self, threshold: float) -> None:
-        self.threshold = min(1.0, max(0.0, float(threshold)))
-        import torch
-
-        model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
-        model.eval()
-
-        self._torch = torch
-        self._model = model
-
-    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool:
-        if sample_rate != 16000:
-            return False
-        audio = np.frombuffer(pcm16, dtype=np.int16)
-        if audio.size == 0:
-            return False
-
-        tensor = self._torch.from_numpy(audio.astype(np.float32) / 32768.0)
-        with self._torch.no_grad():
-            probability = float(self._model(tensor, sample_rate).item())
-        return probability >= self.threshold
-
-
 class VoiceController:
     SAMPLE_RATE = 16000
     CHANNELS = 1
-    _WAKE_AUX_FILES = ("melspectrogram.onnx", "embedding_model.onnx")
-    _DEFAULT_WAKE_MODEL = "hey_jarvis_v0.1.onnx"
-    _WAKE_MODELS_REPO_BASE = "https://huggingface.co/davidscripka/openwakeword/resolve/main/onnx"
+    FRAME_MS = 20
+    FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
 
     def __init__(
         self,
@@ -87,7 +44,6 @@ class VoiceController:
         self._tts_engine = None
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
         self._volume_0_1 = self._read_volume_from_env()
-        self._vad_backend: VadBackend | None = None
 
     def start(self) -> None:
         if self.is_running():
@@ -109,9 +65,7 @@ class VoiceController:
 
     def speak(self, text: str) -> None:
         cleaned = sanitize_for_tts(text)
-        if not cleaned:
-            return
-        if self._stop_event.is_set():
+        if not cleaned or self._stop_event.is_set():
             return
 
         self.on_status("Speaking")
@@ -133,7 +87,7 @@ class VoiceController:
                     nonlocal run_error
                     try:
                         engine.runAndWait()
-                    except Exception as exc:  # pragma: no cover - depends on TTS backend
+                    except Exception as exc:  # pragma: no cover
                         run_error = exc
 
                 worker = threading.Thread(target=_run_and_wait, daemon=True, name="tts-runner")
@@ -161,43 +115,21 @@ class VoiceController:
         try:
             import sounddevice as sd
             from faster_whisper import WhisperModel
-            from openwakeword.model import Model
+            from vosk import KaldiRecognizer, Model
 
-            wake_paths = self._resolve_wake_model_paths()
-            if wake_paths is None:
-                return
+            vosk_model_path = os.getenv("JARVIS_VOSK_MODEL_PATH", "").strip()
+            if not vosk_model_path:
+                raise RuntimeError("Не задан JARVIS_VOSK_MODEL_PATH (путь к vosk-model-small-ru-0.22)")
+            vosk_model = Model(vosk_model_path)
+            wake_rec = KaldiRecognizer(vosk_model, self.SAMPLE_RATE, '["джарвис"]')
 
-            try:
-                wake_model = self._build_wake_model(
-                    Model=Model,
-                    wake_model_path=wake_paths["wake_model"],
-                    melspectrogram_path=wake_paths["melspectrogram"],
-                    embedding_path=wake_paths["embedding"],
-                )
-            except Exception as exc:
-                self.logger.log("voice_error", {"stage": "wake_init", "error": str(exc)})
-                self.on_error(f"Wake word недоступен: ошибка инициализации ONNX модели ({exc})")
-                return
-            self.logger.log(
-                "wake_backend_selected",
-                {
-                    "backend": "openwakeword",
-                    "framework": "onnx",
-                    "model": str(wake_paths["wake_model"]),
-                },
-            )
-
-            wake_threshold = self._float_env("JARVIS_WAKE_THRESHOLD", 0.65)
-            wake_cooldown = self._float_env("JARVIS_WAKE_COOLDOWN", 2.0)
-            start_timeout = self._float_env("JARVIS_COMMAND_START_TIMEOUT", 3.0)
-            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1000, min_value=200, max_value=3000)
-            max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
+            command_max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
+            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 900, min_value=300, max_value=3000)
+            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 700.0)
             whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
             beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
-
-            vad = self._resolve_vad_backend()
-            whisper_model = WhisperModel(whisper_model_name, device="cpu", compute_type="int8")
             device = self._resolve_audio_device(sd)
+            whisper_model = WhisperModel(whisper_model_name, device="cpu", compute_type="int8")
 
             def audio_callback(indata, frames, callback_time, status) -> None:
                 del frames, callback_time
@@ -218,40 +150,27 @@ class VoiceController:
                 channels=self.CHANNELS,
                 dtype="int16",
                 callback=audio_callback,
-                blocksize=320,
+                blocksize=self.FRAME_SAMPLES,
                 device=device,
             ):
                 self.logger.log("voice_started", {})
                 self.on_status("Listening")
-                consecutive_hits = 0
-                cooldown_until = 0.0
+
                 while not self._stop_event.is_set():
                     chunk = self._next_chunk(timeout=0.2)
                     if chunk is None:
                         continue
 
-                    if time.monotonic() < cooldown_until:
-                        continue
-
-                    score, score_model_name = self._wake_score(wake_model, chunk, wake_paths["wake_model"].stem)
-                    if score >= wake_threshold:
-                        consecutive_hits += 1
+                    if wake_rec.AcceptWaveform(chunk.tobytes()):
+                        result = self._extract_text(wake_rec.Result())
                     else:
-                        consecutive_hits = 0
+                        result = self._extract_text(wake_rec.PartialResult())
 
-                    if consecutive_hits < 3:
+                    if "джарвис" not in result:
                         continue
 
-                    consecutive_hits = 0
-                    cooldown_until = time.monotonic() + wake_cooldown
-                    self.logger.log(
-                        "wake_word_detected",
-                        {
-                            "score": round(score, 4),
-                            "threshold": wake_threshold,
-                            "model": score_model_name,
-                        },
-                    )
+                    self.logger.log("wake_word_detected", {"word": "джарвис"})
+                    wake_rec.Reset()
                     self.on_status("Heard wake word")
 
                     if self.is_busy():
@@ -260,27 +179,26 @@ class VoiceController:
 
                     self.speak("Слушаю")
                     command = self._capture_and_transcribe(
-                        vad=vad,
                         whisper_model=whisper_model,
-                        start_timeout=start_timeout,
+                        max_sec=command_max_sec,
                         silence_ms=silence_ms,
-                        max_sec=max_sec,
+                        rms_threshold=rms_threshold,
                         beam_size=beam_size,
                     )
                     if not command and not self._stop_event.is_set():
                         self.speak("Да?")
                         command = self._capture_and_transcribe(
-                            vad=vad,
                             whisper_model=whisper_model,
-                            start_timeout=start_timeout,
+                            max_sec=command_max_sec,
                             silence_ms=silence_ms,
-                            max_sec=max_sec,
+                            rms_threshold=rms_threshold,
                             beam_size=beam_size,
                         )
 
                     if command:
                         self.logger.log("stt_text", {"text": command})
                         self.on_user_text(command)
+
                     self.on_status("Listening")
 
         except Exception as exc:
@@ -293,101 +211,40 @@ class VoiceController:
             if self.on_stopped:
                 self.on_stopped()
 
-    def _resolve_vad_backend(self) -> VadBackend:
-        if self._vad_backend is not None:
-            return self._vad_backend
-
-        requested = os.getenv("JARVIS_VAD_BACKEND", "silero").strip().lower()
-        silero_threshold = self._float_env("JARVIS_SILERO_VAD_THRESHOLD", 0.5)
-        lite_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 700.0)
-
-        if requested == "lite":
-            backend = LiteVadBackend(rms_threshold=lite_threshold)
-            self.logger.log("vad_backend_selected", {"backend": "lite", "rms_threshold": lite_threshold})
-            self._vad_backend = backend
-            return backend
-
-        try:
-            backend = SileroVadBackend(threshold=silero_threshold)
-            self.logger.log(
-                "vad_backend_selected",
-                {"backend": "silero", "threshold": silero_threshold},
-            )
-            self._vad_backend = backend
-            return backend
-        except Exception as exc:
-            self.logger.log("voice_error", {"stage": "vad_init", "error": str(exc)})
-            self.on_error("Silero VAD недоступен, переключаюсь на VAD-lite")
-            backend = LiteVadBackend(rms_threshold=lite_threshold)
-            self.logger.log(
-                "vad_backend_selected",
-                {
-                    "backend": "lite",
-                    "fallback": "silero_init_failed",
-                    "rms_threshold": lite_threshold,
-                },
-            )
-            self._vad_backend = backend
-            return backend
-
     def _capture_and_transcribe(
         self,
-        vad: VadBackend,
         whisper_model,
-        start_timeout: float,
-        silence_ms: int,
         max_sec: float,
+        silence_ms: int,
+        rms_threshold: float,
         beam_size: int,
     ) -> str | None:
-        frame_samples = 320
-        frame_bytes = frame_samples * 2
-        start_deadline = time.monotonic() + start_timeout
-        silence_frames_limit = max(1, int(silence_ms / 20))
+        max_frames = int((max_sec * 1000) / self.FRAME_MS)
+        silence_limit = max(1, int(silence_ms / self.FRAME_MS))
+        frames: list[np.ndarray] = []
+        speech_detected = False
+        silent_frames = 0
 
-        collected = np.empty(0, dtype=np.int16)
-        speech_started = False
-        silence_frames = 0
-        speech_start_ts = 0.0
-        speech_frames: list[np.ndarray] = []
-
-        while not self._stop_event.is_set():
-            timeout = 0.3 if speech_started else max(0.1, start_deadline - time.monotonic())
-            chunk = self._next_chunk(timeout=timeout)
+        while not self._stop_event.is_set() and len(frames) < max_frames:
+            chunk = self._next_chunk(timeout=0.3)
             if chunk is None:
-                if not speech_started and time.monotonic() > start_deadline:
-                    return None
                 continue
 
-            collected = np.concatenate((collected, chunk))
-            while collected.size >= frame_samples:
-                frame = collected[:frame_samples]
-                collected = collected[frame_samples:]
-                if len(frame.tobytes()) != frame_bytes:
-                    continue
-                speech = vad.is_speech(frame.tobytes(), self.SAMPLE_RATE)
-                if speech:
-                    if not speech_started:
-                        speech_started = True
-                        speech_start_ts = time.monotonic()
-                        self.logger.log("vad_start", {})
-                    silence_frames = 0
-                elif speech_started:
-                    silence_frames += 1
+            frames.append(chunk.copy())
+            rms = self._chunk_rms(chunk)
+            is_speech = rms >= rms_threshold
+            if is_speech:
+                speech_detected = True
+                silent_frames = 0
+            elif speech_detected:
+                silent_frames += 1
 
-                if speech_started:
-                    speech_frames.append(frame.copy())
+            if speech_detected and silent_frames >= silence_limit:
+                break
 
-                if speech_started and silence_frames >= silence_frames_limit:
-                    duration_ms = int((time.monotonic() - speech_start_ts) * 1000)
-                    self.logger.log("vad_end", {"duration_ms": duration_ms})
-                    return self._transcribe_audio(whisper_model, frames=speech_frames, beam_size=beam_size)
-
-                if speech_started and (time.monotonic() - speech_start_ts) >= max_sec:
-                    duration_ms = int((time.monotonic() - speech_start_ts) * 1000)
-                    self.logger.log("vad_end", {"duration_ms": duration_ms})
-                    return self._transcribe_audio(whisper_model, frames=speech_frames, beam_size=beam_size)
-
-        return None
+        if not speech_detected:
+            return None
+        return self._transcribe_audio(whisper_model=whisper_model, frames=frames, beam_size=beam_size)
 
     def _transcribe_audio(self, whisper_model, frames: list[np.ndarray], beam_size: int) -> str | None:
         if self._stop_event.is_set() or not frames:
@@ -399,23 +256,29 @@ class VoiceController:
             text = " ".join(segment.text.strip() for segment in segments).strip()
             if text:
                 return text
-            self.speak("Не расслышал")
             return None
         except Exception as exc:
             self.logger.log("voice_error", {"stage": "transcribe", "error": str(exc)})
             self.on_error(f"Ошибка распознавания речи: {exc}")
             return None
 
-    def _wake_score(self, wake_model, chunk: np.ndarray, fallback_name: str) -> tuple[float, str]:
-        prediction = wake_model.predict(chunk)
-        if not isinstance(prediction, dict) or not prediction:
-            return 0.0, fallback_name
+    @staticmethod
+    def _extract_text(payload: str) -> str:
+        try:
+            data = json.loads(payload or "{}")
+        except json.JSONDecodeError:
+            return ""
+        if "text" in data and isinstance(data["text"], str):
+            return data["text"].lower()
+        if "partial" in data and isinstance(data["partial"], str):
+            return data["partial"].lower()
+        return ""
 
-        if "hey_jarvis" in prediction:
-            return float(prediction["hey_jarvis"]), "hey_jarvis"
-
-        best_name, best_score = max(prediction.items(), key=lambda item: float(item[1]))
-        return float(best_score), str(best_name)
+    @staticmethod
+    def _chunk_rms(chunk: np.ndarray) -> float:
+        if chunk.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(chunk.astype(np.float32)))))
 
     def _next_chunk(self, timeout: float) -> np.ndarray | None:
         if self._stop_event.is_set():
@@ -478,135 +341,6 @@ class VoiceController:
         if value > 1.0:
             value = value / 100.0
         return max(0.0, min(1.0, value))
-
-    def _build_wake_model(self, Model, wake_model_path: Path, melspectrogram_path: Path, embedding_path: Path):
-        init_attempts = [
-            {
-                "melspec_model_path": str(melspectrogram_path),
-                "embedding_model_path": str(embedding_path),
-            },
-            {
-                "melspectrogram_model_path": str(melspectrogram_path),
-                "embedding_model_path": str(embedding_path),
-            },
-        ]
-        last_exc: Exception | None = None
-        for kwargs in init_attempts:
-            try:
-                return Model(
-                    inference_framework="onnx",
-                    wakeword_models=[str(wake_model_path)],
-                    **kwargs,
-                )
-            except TypeError as exc:
-                last_exc = exc
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("Failed to initialize wake model")
-
-    def _resolve_wake_model_paths(self) -> dict[str, Path] | None:
-        wake_model_env = os.getenv("JARVIS_WAKE_MODEL_PATH", "").strip()
-        models_dir_env = os.getenv("JARVIS_WAKE_MODELS_DIR", "").strip()
-
-        if wake_model_env:
-            wake_model_path = Path(wake_model_env).expanduser().resolve()
-            models_dir = wake_model_path.parent
-        else:
-            models_dir = self._default_wake_models_dir(models_dir_env)
-            wake_model_path = models_dir / self._DEFAULT_WAKE_MODEL
-            if not wake_model_path.exists():
-                fallback = self._pick_any_wake_model(models_dir)
-                if fallback is not None:
-                    wake_model_path = fallback
-
-        melspectrogram_path = models_dir / self._WAKE_AUX_FILES[0]
-        embedding_path = models_dir / self._WAKE_AUX_FILES[1]
-
-        missing = [
-            str(path)
-            for path in (wake_model_path, melspectrogram_path, embedding_path)
-            if not path.exists()
-        ]
-        if missing and self._is_truthy_env("JARVIS_AUTO_DOWNLOAD_MODELS"):
-            self._download_missing_models(
-                models_dir=models_dir,
-                wake_model_filename=wake_model_path.name,
-                missing_paths=missing,
-            )
-            missing = [
-                str(path)
-                for path in (wake_model_path, melspectrogram_path, embedding_path)
-                if not path.exists()
-            ]
-
-        if missing:
-            details = {
-                "models_dir": str(models_dir),
-                "wake_model_path": str(wake_model_path),
-                "missing_files": missing,
-                "auto_download": self._is_truthy_env("JARVIS_AUTO_DOWNLOAD_MODELS"),
-            }
-            self.logger.log("voice_error", {"stage": "wake_init", "error": "missing model files", "details": details})
-            self.on_error(
-                "Wake word недоступен: не найдены ONNX модели openWakeWord.\n"
-                "Скачай melspectrogram.onnx, embedding_model.onnx и hey_jarvis_v0.1.onnx в models/openwakeword/\n"
-                "или укажи путь через JARVIS_WAKE_MODEL_PATH."
-            )
-            return None
-
-        return {
-            "wake_model": wake_model_path,
-            "melspectrogram": melspectrogram_path,
-            "embedding": embedding_path,
-        }
-
-    def _default_wake_models_dir(self, models_dir_env: str) -> Path:
-        if models_dir_env:
-            return Path(models_dir_env).expanduser().resolve()
-        project_root = Path(__file__).resolve().parent.parent
-        return (project_root / "models" / "openwakeword").resolve()
-
-    def _pick_any_wake_model(self, models_dir: Path) -> Path | None:
-        if not models_dir.exists():
-            return None
-        for candidate in sorted(models_dir.glob("*.onnx")):
-            if candidate.name in self._WAKE_AUX_FILES:
-                continue
-            return candidate
-        return None
-
-    def _download_missing_models(self, models_dir: Path, wake_model_filename: str, missing_paths: list[str]) -> None:
-        models_dir.mkdir(parents=True, exist_ok=True)
-        model_filenames = [
-            wake_model_filename,
-            self._WAKE_AUX_FILES[0],
-            self._WAKE_AUX_FILES[1],
-        ]
-        unique_filenames = []
-        for item in model_filenames:
-            if item not in unique_filenames:
-                unique_filenames.append(item)
-
-        for filename in unique_filenames:
-            target = models_dir / filename
-            if target.exists():
-                continue
-            url = f"{self._WAKE_MODELS_REPO_BASE}/{filename}"
-            try:
-                urllib.request.urlretrieve(url, target)
-            except Exception as exc:
-                self.logger.log(
-                    "voice_error",
-                    {
-                        "stage": "wake_download",
-                        "error": str(exc),
-                        "details": {"url": url, "target": str(target), "missing_paths": missing_paths},
-                    },
-                )
-
-    @staticmethod
-    def _is_truthy_env(key: str) -> bool:
-        return os.getenv(key, "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _float_env(self, key: str, default: float) -> float:
         raw = os.getenv(key)
