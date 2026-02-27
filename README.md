@@ -56,7 +56,7 @@ python main.py
 ## Voice mode (offline)
 
 - Включается кнопкой `Voice: ON` в верхней панели.
-- Wake word в UI/логах: `джарвис` (детекция через `openWakeWord` модель `hey_jarvis`).
+- Wake word в UI/логах: `джарвис` (детекция через `openWakeWord` ONNX-модель из локальной папки проекта).
 - После wake word ассистент говорит «Слушаю», записывает команду по VAD и отправляет её в стандартный текстовый pipeline.
 - Ответ появляется в чате и озвучивается через `pyttsx3`.
 - Если ассистент уже выполняет задачу, на wake word он отвечает «Подожди секунду».
@@ -67,8 +67,9 @@ python main.py
 
 - `JARVIS_WAKE_THRESHOLD` (default `0.65`)
 - `JARVIS_WAKE_COOLDOWN` (default `2.0`)
-- `JARVIS_WAKE_BACKEND` (default `onnx`; другие значения не поддерживаются)
-- `JARVIS_WAKE_MODEL` (default `hey_jarvis`)
+- `JARVIS_WAKE_MODEL_PATH` (optional: путь к конкретному wake-model `*.onnx`; рядом должны лежать `melspectrogram.onnx` и `embedding_model.onnx`)
+- `JARVIS_WAKE_MODELS_DIR` (optional: каталог моделей; default `models/openwakeword/`)
+- `JARVIS_AUTO_DOWNLOAD_MODELS` (optional: `1|true|yes|on`; разрешает авто-скачивание ONNX моделей с HuggingFace)
 - `JARVIS_VAD_BACKEND` (`silero|lite`, default `silero`)
 - `JARVIS_SILERO_VAD_THRESHOLD` (default `0.5`)
 - `JARVIS_VAD_RMS_THRESHOLD` (default `700`)
@@ -80,6 +81,30 @@ python main.py
 - `JARVIS_AUDIO_DEVICE` (optional: индекс или подстрока имени устройства ввода)
 - `JARVIS_TTS_VOLUME` (default `0.8`; можно задавать как `0..1` или `0..100`)
 
+
+### Wake word models (ONNX)
+
+Для Windows + Python 3.12 в проекте используется только ONNX backend для `openWakeWord`:
+
+- `tflite-runtime` здесь **не используется** (и не требуется).
+- Нужно положить ONNX-модели в `models/openwakeword/` (или указать прямой путь через `JARVIS_WAKE_MODEL_PATH`).
+- Источник моделей: HuggingFace репозиторий `davidscripka/openwakeword`.
+
+Обязательные файлы:
+
+- `melspectrogram.onnx`
+- `embedding_model.onnx`
+- `hey_jarvis_v0.1.onnx` (или другой wake-model `.onnx`)
+
+Если модель не найдена, Jarvis корректно отключит Voice mode и покажет инструкцию с нужными файлами.
+
+Опционально можно включить авто-скачивание отсутствующих ONNX файлов:
+
+```bash
+set JARVIS_AUTO_DOWNLOAD_MODELS=1
+```
+
+По умолчанию авто-скачивание выключено, поэтому Voice mode остается оффлайн без неожиданных сетевых запросов.
 
 ### Ограничение для Windows + Python 3.12
 

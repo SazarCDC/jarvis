@@ -5,6 +5,8 @@ import queue
 import re
 import threading
 import time
+import urllib.request
+from pathlib import Path
 from typing import Callable, Protocol
 
 import numpy as np
@@ -57,6 +59,9 @@ class SileroVadBackend:
 class VoiceController:
     SAMPLE_RATE = 16000
     CHANNELS = 1
+    _WAKE_AUX_FILES = ("melspectrogram.onnx", "embedding_model.onnx")
+    _DEFAULT_WAKE_MODEL = "hey_jarvis_v0.1.onnx"
+    _WAKE_MODELS_REPO_BASE = "https://huggingface.co/davidscripka/openwakeword/resolve/main/onnx"
 
     def __init__(
         self,
@@ -158,27 +163,28 @@ class VoiceController:
             from faster_whisper import WhisperModel
             from openwakeword.model import Model
 
-            wake_backend = (os.getenv("JARVIS_WAKE_BACKEND", "onnx").strip().lower() or "onnx")
-            wake_model_name = os.getenv("JARVIS_WAKE_MODEL", "hey_jarvis").strip() or "hey_jarvis"
-            if wake_backend != "onnx":
-                self.logger.log(
-                    "voice_error",
-                    {"stage": "wake_init", "error": f"Unsupported wake backend: {wake_backend}"},
-                )
-                self.on_error("Wake word недоступен: требуется onnxruntime")
+            wake_paths = self._resolve_wake_model_paths()
+            if wake_paths is None:
                 return
+
             try:
-                wake_model = Model(
-                    inference_framework="onnx",
-                    wakeword_models=[wake_model_name],
+                wake_model = self._build_wake_model(
+                    Model=Model,
+                    wake_model_path=wake_paths["wake_model"],
+                    melspectrogram_path=wake_paths["melspectrogram"],
+                    embedding_path=wake_paths["embedding"],
                 )
             except Exception as exc:
                 self.logger.log("voice_error", {"stage": "wake_init", "error": str(exc)})
-                self.on_error("Wake word недоступен: требуется onnxruntime")
+                self.on_error(f"Wake word недоступен: ошибка инициализации ONNX модели ({exc})")
                 return
             self.logger.log(
                 "wake_backend_selected",
-                {"backend": "openwakeword", "framework": wake_backend, "model": wake_model_name},
+                {
+                    "backend": "openwakeword",
+                    "framework": "onnx",
+                    "model": str(wake_paths["wake_model"]),
+                },
             )
 
             wake_threshold = self._float_env("JARVIS_WAKE_THRESHOLD", 0.65)
@@ -227,7 +233,7 @@ class VoiceController:
                     if time.monotonic() < cooldown_until:
                         continue
 
-                    score, score_model_name = self._wake_score(wake_model, chunk, wake_model_name)
+                    score, score_model_name = self._wake_score(wake_model, chunk, wake_paths["wake_model"].stem)
                     if score >= wake_threshold:
                         consecutive_hits += 1
                     else:
@@ -472,6 +478,135 @@ class VoiceController:
         if value > 1.0:
             value = value / 100.0
         return max(0.0, min(1.0, value))
+
+    def _build_wake_model(self, Model, wake_model_path: Path, melspectrogram_path: Path, embedding_path: Path):
+        init_attempts = [
+            {
+                "melspec_model_path": str(melspectrogram_path),
+                "embedding_model_path": str(embedding_path),
+            },
+            {
+                "melspectrogram_model_path": str(melspectrogram_path),
+                "embedding_model_path": str(embedding_path),
+            },
+        ]
+        last_exc: Exception | None = None
+        for kwargs in init_attempts:
+            try:
+                return Model(
+                    inference_framework="onnx",
+                    wakeword_models=[str(wake_model_path)],
+                    **kwargs,
+                )
+            except TypeError as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Failed to initialize wake model")
+
+    def _resolve_wake_model_paths(self) -> dict[str, Path] | None:
+        wake_model_env = os.getenv("JARVIS_WAKE_MODEL_PATH", "").strip()
+        models_dir_env = os.getenv("JARVIS_WAKE_MODELS_DIR", "").strip()
+
+        if wake_model_env:
+            wake_model_path = Path(wake_model_env).expanduser().resolve()
+            models_dir = wake_model_path.parent
+        else:
+            models_dir = self._default_wake_models_dir(models_dir_env)
+            wake_model_path = models_dir / self._DEFAULT_WAKE_MODEL
+            if not wake_model_path.exists():
+                fallback = self._pick_any_wake_model(models_dir)
+                if fallback is not None:
+                    wake_model_path = fallback
+
+        melspectrogram_path = models_dir / self._WAKE_AUX_FILES[0]
+        embedding_path = models_dir / self._WAKE_AUX_FILES[1]
+
+        missing = [
+            str(path)
+            for path in (wake_model_path, melspectrogram_path, embedding_path)
+            if not path.exists()
+        ]
+        if missing and self._is_truthy_env("JARVIS_AUTO_DOWNLOAD_MODELS"):
+            self._download_missing_models(
+                models_dir=models_dir,
+                wake_model_filename=wake_model_path.name,
+                missing_paths=missing,
+            )
+            missing = [
+                str(path)
+                for path in (wake_model_path, melspectrogram_path, embedding_path)
+                if not path.exists()
+            ]
+
+        if missing:
+            details = {
+                "models_dir": str(models_dir),
+                "wake_model_path": str(wake_model_path),
+                "missing_files": missing,
+                "auto_download": self._is_truthy_env("JARVIS_AUTO_DOWNLOAD_MODELS"),
+            }
+            self.logger.log("voice_error", {"stage": "wake_init", "error": "missing model files", "details": details})
+            self.on_error(
+                "Wake word недоступен: не найдены ONNX модели openWakeWord.\n"
+                "Скачай melspectrogram.onnx, embedding_model.onnx и hey_jarvis_v0.1.onnx в models/openwakeword/\n"
+                "или укажи путь через JARVIS_WAKE_MODEL_PATH."
+            )
+            return None
+
+        return {
+            "wake_model": wake_model_path,
+            "melspectrogram": melspectrogram_path,
+            "embedding": embedding_path,
+        }
+
+    def _default_wake_models_dir(self, models_dir_env: str) -> Path:
+        if models_dir_env:
+            return Path(models_dir_env).expanduser().resolve()
+        project_root = Path(__file__).resolve().parent.parent
+        return (project_root / "models" / "openwakeword").resolve()
+
+    def _pick_any_wake_model(self, models_dir: Path) -> Path | None:
+        if not models_dir.exists():
+            return None
+        for candidate in sorted(models_dir.glob("*.onnx")):
+            if candidate.name in self._WAKE_AUX_FILES:
+                continue
+            return candidate
+        return None
+
+    def _download_missing_models(self, models_dir: Path, wake_model_filename: str, missing_paths: list[str]) -> None:
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_filenames = [
+            wake_model_filename,
+            self._WAKE_AUX_FILES[0],
+            self._WAKE_AUX_FILES[1],
+        ]
+        unique_filenames = []
+        for item in model_filenames:
+            if item not in unique_filenames:
+                unique_filenames.append(item)
+
+        for filename in unique_filenames:
+            target = models_dir / filename
+            if target.exists():
+                continue
+            url = f"{self._WAKE_MODELS_REPO_BASE}/{filename}"
+            try:
+                urllib.request.urlretrieve(url, target)
+            except Exception as exc:
+                self.logger.log(
+                    "voice_error",
+                    {
+                        "stage": "wake_download",
+                        "error": str(exc),
+                        "details": {"url": url, "target": str(target), "missing_paths": missing_paths},
+                    },
+                )
+
+    @staticmethod
+    def _is_truthy_env(key: str) -> bool:
+        return os.getenv(key, "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _float_env(self, key: str, default: float) -> float:
         raw = os.getenv(key)
