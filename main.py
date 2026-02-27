@@ -78,7 +78,7 @@ def main() -> None:
         command_timeout_sec=CONFIG.command_timeout_sec,
     )
 
-    app = JarvisApp(assistant)
+    app = JarvisApp(assistant=assistant, logger=logger)
     app.mainloop()
 
 
