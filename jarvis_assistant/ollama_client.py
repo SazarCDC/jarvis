@@ -53,8 +53,14 @@ SYSTEM_PROMPT = """
 - browser = интернет/сайты/новости/погода/картинки/поиск в сети.
 - Для запросов "в интернете", "в сети", "погода", "новости", "картинки", "фото" всегда используй browser.
 - Для browser в response пиши voice-friendly фразы без URL (например: "Открываю результаты в браузере.").
-- Для "закрой блокнот" предпочитай window close: {"type":"window","args":{"command":"close","title":"Блокнот"}}.
-- Если нужно принудительно, используй cmd taskkill: {"type":"cmd","command":"taskkill /IM notepad.exe /F","args":{}}.
+- Для «открой/запусти <приложение>» всегда используй launch (например: notepad.exe, calc.exe, chrome.exe, ms-settings:).
+- window используй ТОЛЬКО для управления уже открытым окном: activate/minimize/maximize/close.
+- Для window всегда заполняй args.command, иначе действие недопустимо.
+- «Открой параметры» = launch с path="ms-settings:" (НЕ window).
+- Пример: «Открой блокнот» -> {"type":"launch","path":"notepad.exe","args":{}}.
+- Пример: «Закрой блокнот» -> {"type":"window","args":{"command":"close","title":"Блокнот"}}.
+- Пример: «Открой параметры» -> {"type":"launch","path":"ms-settings:","args":{}}.
+- Если нужно принудительно закрыть блокнот, используй cmd taskkill: {"type":"cmd","command":"taskkill /IM notepad.exe /F","args":{}}.
 - Пример "найди котиков в интернете": {"intent":"action","thought":"Открываю поиск картинок","confidence":0.92,"ask_user":null,"response":"Открываю результаты поиска в браузере.","memory_update":null,"actions":[{"type":"browser","command":"https://duckduckgo.com/?q=котики&iax=images&ia=images","args":{}}]}.
 - Если неуверен, заполни ask_user.
 """.strip()
@@ -246,6 +252,9 @@ class OllamaClient:
                     continue
 
             fixed = OllamaClient._normalize_action_routing(fixed, user_input)
+            if not fixed:
+                notes.append("убрал некорректное действие")
+                continue
 
             if fixed.get("type") not in ALLOWED_ACTION_TYPES:
                 notes.append("убрал неподдерживаемое действие")
@@ -261,18 +270,37 @@ class OllamaClient:
             if not normalized.get("response"):
                 normalized["response"] = "Я немного уточнил план действий."
             if not normalized.get("ask_user") and not cleaned_actions:
-                normalized["ask_user"] = "Уточните, пожалуйста, что именно выполнить."
+                if any(token in user_input.lower() for token in ("открой", "запусти")):
+                    normalized["ask_user"] = "Что именно открыть?"
+                else:
+                    normalized["ask_user"] = "Уточните, пожалуйста, что именно выполнить."
                 normalized["intent"] = "question"
 
         return normalized
 
     @staticmethod
-    def _normalize_action_routing(action: dict[str, Any], user_input: str) -> dict[str, Any]:
+    def _normalize_action_routing(action: dict[str, Any], user_input: str) -> dict[str, Any] | None:
         fixed = action.copy()
         action_type = str(fixed.get("type") or "").lower()
         command = str(fixed.get("command") or "")
         command_lower = command.lower().strip()
         intent_text = user_input.lower()
+        is_open_request = any(token in intent_text for token in ("открой", "запусти"))
+
+        if action_type == "window" and is_open_request:
+            if "блокнот" in intent_text:
+                return {"type": "launch", "path": "notepad.exe", "args": {}}
+            if "параметры" in intent_text:
+                return {"type": "launch", "path": "ms-settings:", "args": {}}
+            if "хром" in intent_text or "chrome" in intent_text:
+                return {"type": "launch", "path": "chrome.exe", "args": {}}
+            return None
+
+        if action_type == "window":
+            args = fixed.get("args") if isinstance(fixed.get("args"), dict) else {}
+            window_command = str(args.get("command") or "").strip().lower()
+            if not window_command:
+                return None
 
         if action_type == "launch" and command_lower:
             if command_lower.startswith("taskkill"):
@@ -287,10 +315,12 @@ class OllamaClient:
             fixed["type"] = "browser"
             fixed["command"] = f"https://duckduckgo.com/?q={query}"
 
-        if action_type == "launch":
+        if fixed.get("type") == "launch":
             target = f"{fixed.get('path') or ''} {fixed.get('command') or ''}".lower()
             if "chrome" in target and (not fixed.get("path") or fixed.get("path") in {"chrome", "google chrome"}):
                 fixed["path"] = "chrome.exe"
+            if "ms-settings" in target:
+                fixed["path"] = "ms-settings:"
 
         return fixed
 
