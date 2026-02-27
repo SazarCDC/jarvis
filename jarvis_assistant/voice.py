@@ -3,11 +3,10 @@ from __future__ import annotations
 import os
 import queue
 import re
-import shutil
 import subprocess
 import threading
 import time
-import wave
+import json
 from typing import Callable
 
 import numpy as np
@@ -134,10 +133,10 @@ class VoiceController:
                 try:
                     self._set_status("Speaking")
                     self.logger.log("tts_started", {"text": text[:120]})
-                    audio, sample_rate = self._tts_backend.synthesize(text)
-                    if audio is None:
+                    pcm_bytes, sample_rate = self._tts_backend.synthesize_stream_raw(text)
+                    if pcm_bytes is None:
                         continue
-                    self._tts_backend.play(audio=audio, sample_rate=sample_rate)
+                    self._tts_backend.play(pcm_bytes=pcm_bytes, sample_rate=sample_rate)
                     if self._tts_stop_event.is_set():
                         break
                     self.logger.log("tts_finished", {"text": text[:120]})
@@ -462,13 +461,15 @@ class PiperTTS:
         self._rate = rate
         self._playback_lock = threading.Lock()
         self._current_stream = None
+        self._piper_process: subprocess.Popen | None = None
+        self._process_lock = threading.Lock()
 
         self._backend = os.getenv("JARVIS_TTS_BACKEND", "piper").strip().lower() or "piper"
         self._model_path = os.getenv("JARVIS_PIPER_MODEL_PATH", "").strip()
-        self._piper_exe_path = os.getenv("JARVIS_PIPER_EXE_PATH", "").strip() or shutil.which("piper")
-        self._python_voice = None
+        self._piper_exe_path = os.getenv("JARVIS_PIPER_EXE_PATH", "").strip()
         self._available = False
         self._default_sample_rate = 22050
+        self._default_sample_rate = self._resolve_sample_rate_from_model_config()
         self._init_backend()
 
     def _init_backend(self) -> None:
@@ -481,103 +482,105 @@ class PiperTTS:
         if not os.path.isfile(self._model_path):
             self.on_error(f"TTS недоступен: модель Piper не найдена: {self._model_path}")
             return
-
-        self._python_voice = self._load_python_piper_voice()
-        if self._python_voice is not None:
-            self._available = True
-            self.logger.log("tts_backend_selected", {"backend": "piper_python"})
-            return
-
         if self._piper_exe_path and os.path.isfile(self._piper_exe_path):
             self._available = True
-            self.logger.log("tts_backend_selected", {"backend": "piper_subprocess", "exe": self._piper_exe_path})
+            self.logger.log(
+                "tts_backend_selected",
+                {"backend": "piper_subprocess_raw", "exe": self._piper_exe_path, "sample_rate": self._default_sample_rate},
+            )
             return
 
-        self.on_error("TTS недоступен: не найден piper-tts и не задан JARVIS_PIPER_EXE_PATH")
+        self.on_error("TTS недоступен: JARVIS_PIPER_EXE_PATH обязателен и должен указывать на piper.exe")
 
-    def _load_python_piper_voice(self):
+    def _resolve_sample_rate_from_model_config(self) -> int:
+        if not self._model_path:
+            return 22050
+        candidates = [f"{self._model_path}.json"]
+        if self._model_path.endswith(".onnx"):
+            candidates.append(self._model_path.replace(".onnx", ".onnx.json"))
+        for config_path in candidates:
+            if not os.path.isfile(config_path):
+                continue
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                sample_rate = data.get("audio", {}).get("sample_rate")
+                if isinstance(sample_rate, int) and sample_rate > 1000:
+                    return sample_rate
+            except Exception as exc:
+                self.logger.log("tts_error", {"stage": "piper_sample_rate", "error": str(exc), "path": config_path})
+        return 22050
+
+    def _register_process(self, process: subprocess.Popen | None) -> None:
+        with self._process_lock:
+            self._piper_process = process
+
+    def _terminate_piper_process(self) -> None:
+        process = None
+        with self._process_lock:
+            if self._piper_process is not None and self._piper_process.poll() is None:
+                process = self._piper_process
+            self._piper_process = None
+        if process is None:
+            return
         try:
-            from piper.voice import PiperVoice
-
-            config_path = f"{self._model_path}.json"
-            kwargs = {"model_path": self._model_path}
-            if os.path.isfile(config_path):
-                kwargs["config_path"] = config_path
-            voice = PiperVoice.load(**kwargs)
-            sample_rate = getattr(voice.config, "sample_rate", None)
-            if isinstance(sample_rate, int) and sample_rate > 1000:
-                self._default_sample_rate = sample_rate
-            return voice
+            process.terminate()
+            process.wait(timeout=0.5)
         except Exception as exc:
-            self.logger.log("tts_error", {"stage": "piper_python_init", "error": str(exc)})
-            return None
+            self.logger.log("tts_error", {"stage": "piper_terminate", "error": str(exc)})
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def set_volume(self, volume_0_1: float) -> None:
         self._volume_0_1 = min(1.0, max(0.0, float(volume_0_1)))
 
-    def synthesize(self, text: str) -> tuple[np.ndarray | None, int]:
+    def synthesize_stream_raw(self, text: str) -> tuple[bytes | None, int]:
         if not self._available or self.stop_event.is_set():
             return None, self._default_sample_rate
-
-        if self._python_voice is not None:
-            try:
-                pcm_chunks = []
-                for chunk in self._python_voice.synthesize_stream_raw(
-                    text,
-                    speaker_id=None,
-                    length_scale=1.0 / max(self._rate, 0.2),
-                ):
-                    if self.stop_event.is_set():
-                        return None, self._default_sample_rate
-                    pcm_chunks.append(chunk)
-                if not pcm_chunks:
-                    return None, self._default_sample_rate
-                audio = np.frombuffer(b"".join(pcm_chunks), dtype=np.int16).copy()
-                return audio, self._default_sample_rate
-            except Exception as exc:
-                self.logger.log("tts_error", {"stage": "piper_python_synthesize", "error": str(exc)})
-                self.on_error(f"Ошибка Piper TTS: {exc}")
-                return None, self._default_sample_rate
-
-        wav_path = os.path.join(os.getenv("TEMP", "."), f"jarvis_tts_{int(time.time() * 1000)}.wav")
-        cmd = [self._piper_exe_path, "--model", self._model_path, "--output_file", wav_path]
-        cmd.extend(["--length_scale", str(1.0 / max(self._rate, 0.2))])
+        cmd = [self._piper_exe_path, "--model", self._model_path, "--output_raw"]
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                input=text,
-                capture_output=True,
-                text=True,
-                check=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or result.stdout or "piper returned non-zero exit code").strip())
-            with wave.open(wav_path, "rb") as wav_file:
-                sample_rate = wav_file.getframerate()
-                samples = wav_file.readframes(wav_file.getnframes())
-            return np.frombuffer(samples, dtype=np.int16).copy(), sample_rate
+            self._register_process(process)
+            payload = f"{text}\n".encode("utf-8")
+            stdout_data, stderr_data = process.communicate(input=payload)
+            if self.stop_event.is_set():
+                return None, self._default_sample_rate
+            if process.returncode != 0:
+                stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(stderr_text or "piper returned non-zero exit code")
+            return stdout_data, self._default_sample_rate
         except Exception as exc:
             self.logger.log("tts_error", {"stage": "piper_subprocess_synthesize", "error": str(exc)})
             self.on_error(f"Ошибка Piper TTS: {exc}")
             return None, self._default_sample_rate
         finally:
-            try:
-                if os.path.isfile(wav_path):
-                    os.remove(wav_path)
-            except Exception:
-                pass
+            self._register_process(None)
 
-    def play(self, audio: np.ndarray, sample_rate: int) -> None:
-        if self.stop_event.is_set() or audio.size == 0:
+    def play(self, pcm_bytes: bytes, sample_rate: int) -> None:
+        if self.stop_event.is_set() or not pcm_bytes:
             return
         try:
             import sounddevice as sd
 
+            audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if audio.size == 0:
+                return
             scaled = np.clip(audio.astype(np.float32) * self._volume_0_1, -32768, 32767).astype(np.int16)
+            chunk_size = max(1, int(sample_rate * 0.1))
             with self._playback_lock:
                 self._current_stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
                 self._current_stream.start()
-                self._current_stream.write(scaled)
+                start = 0
+                while start < scaled.size and not self.stop_event.is_set():
+                    self._current_stream.write(scaled[start : start + chunk_size])
+                    start += chunk_size
                 self._current_stream.stop()
                 self._current_stream.close()
                 self._current_stream = None
@@ -593,6 +596,8 @@ class PiperTTS:
             sd.stop()
         except Exception:
             pass
+
+        self._terminate_piper_process()
 
         with self._playback_lock:
             if self._current_stream is not None:
