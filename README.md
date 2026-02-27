@@ -5,7 +5,7 @@
 ## Возможности
 
 - Диалоговый интерфейс в одном окне (история, ввод, Execute/Send, STOP, статусы `Idle/Listening/Heard wake word/Thinking/Acting/Speaking`).
-- Полностью оффлайн voice mode: wake word через `openWakeWord` (модель `hey_jarvis`), STT через `faster-whisper`, VAD через `webrtcvad`, TTS через `pyttsx3`.
+- Полностью оффлайн voice mode: wake word через `openWakeWord` (модель `hey_jarvis`), STT через `faster-whisper`, VAD через Silero (`torch`) с fallback на VAD-lite, TTS через `pyttsx3`.
 - Подключение к локальной Ollama по HTTP API (`/api/chat`).
 - Health-check при старте (HEAD `/` и fallback на `GET /api/tags`) с понятной ошибкой.
 - LLM всегда должна возвращать JSON-решение:
@@ -68,7 +68,9 @@ python main.py
 - `JARVIS_WAKE_THRESHOLD` (default `0.65`)
 - `JARVIS_WAKE_COOLDOWN` (default `2.0`)
 - `JARVIS_WAKE_MODEL_PATH` (optional, путь к кастомной wake модели)
-- `JARVIS_VAD_MODE` (`0..3`, default `2`)
+- `JARVIS_VAD_BACKEND` (`silero|lite`, default `silero`)
+- `JARVIS_SILERO_VAD_THRESHOLD` (default `0.5`)
+- `JARVIS_VAD_RMS_THRESHOLD` (default `700`)
 - `JARVIS_COMMAND_SILENCE_MS` (default `1000`)
 - `JARVIS_COMMAND_MAX_SEC` (default `10`)
 - `JARVIS_COMMAND_START_TIMEOUT` (default `3`)
@@ -81,7 +83,9 @@ python main.py
 
 - `sounddevice` не видит микрофон: укажи `JARVIS_AUDIO_DEVICE` (например индекс из `sounddevice.query_devices()`) и проверь драйвер/разрешения Windows.
 - Wake word срабатывает редко/часто: подстрой `JARVIS_WAKE_THRESHOLD` и/или `JARVIS_WAKE_COOLDOWN`.
-- Команда обрезается или не детектится: подстрой `JARVIS_VAD_MODE`, `JARVIS_COMMAND_SILENCE_MS`, `JARVIS_COMMAND_START_TIMEOUT`.
+- Команда обрезается или не детектится: подстрой `JARVIS_SILERO_VAD_THRESHOLD` (Silero) или `JARVIS_VAD_RMS_THRESHOLD` (lite), а также `JARVIS_COMMAND_SILENCE_MS`, `JARVIS_COMMAND_START_TIMEOUT`.
+- На Windows/Python 3.12 `webrtcvad` убран из обязательных зависимостей, чтобы установка проходила без Visual C++ Build Tools.
+- Если `torch` слишком тяжёлый или не устанавливается, задай `JARVIS_VAD_BACKEND=lite`.
 
 ## Архитектура
 

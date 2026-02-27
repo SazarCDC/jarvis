@@ -5,12 +5,53 @@ import queue
 import re
 import threading
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 import numpy as np
 
 from jarvis_assistant.assistant_core import JarvisAssistant
 from jarvis_assistant.logger import JsonlLogger
+
+
+class VadBackend(Protocol):
+    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool: ...
+
+
+class LiteVadBackend:
+    def __init__(self, rms_threshold: float) -> None:
+        self.rms_threshold = max(1.0, float(rms_threshold))
+
+    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool:
+        del sample_rate
+        audio = np.frombuffer(pcm16, dtype=np.int16)
+        if audio.size == 0:
+            return False
+        rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32)))))
+        return rms >= self.rms_threshold
+
+
+class SileroVadBackend:
+    def __init__(self, threshold: float) -> None:
+        self.threshold = min(1.0, max(0.0, float(threshold)))
+        import torch
+
+        model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
+        model.eval()
+
+        self._torch = torch
+        self._model = model
+
+    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool:
+        if sample_rate != 16000:
+            return False
+        audio = np.frombuffer(pcm16, dtype=np.int16)
+        if audio.size == 0:
+            return False
+
+        tensor = self._torch.from_numpy(audio.astype(np.float32) / 32768.0)
+        with self._torch.no_grad():
+            probability = float(self._model(tensor, sample_rate).item())
+        return probability >= self.threshold
 
 
 class VoiceController:
@@ -41,6 +82,7 @@ class VoiceController:
         self._tts_engine = None
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
         self._volume_0_1 = self._read_volume_from_env()
+        self._vad_backend: VadBackend | None = None
 
     def start(self) -> None:
         if self.is_running():
@@ -113,7 +155,6 @@ class VoiceController:
     def _run_loop(self) -> None:
         try:
             import sounddevice as sd
-            import webrtcvad
             from faster_whisper import WhisperModel
             from openwakeword.model import Model
 
@@ -127,14 +168,13 @@ class VoiceController:
 
             wake_threshold = self._float_env("JARVIS_WAKE_THRESHOLD", 0.65)
             wake_cooldown = self._float_env("JARVIS_WAKE_COOLDOWN", 2.0)
-            vad_mode = self._int_env("JARVIS_VAD_MODE", 2, min_value=0, max_value=3)
             start_timeout = self._float_env("JARVIS_COMMAND_START_TIMEOUT", 3.0)
             silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1000, min_value=200, max_value=3000)
             max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
             whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
             beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
 
-            vad = webrtcvad.Vad(vad_mode)
+            vad = self._resolve_vad_backend()
             whisper_model = WhisperModel(whisper_model_name, device="cpu", compute_type="int8")
             device = self._resolve_audio_device(sd)
 
@@ -232,9 +272,46 @@ class VoiceController:
             if self.on_stopped:
                 self.on_stopped()
 
+    def _resolve_vad_backend(self) -> VadBackend:
+        if self._vad_backend is not None:
+            return self._vad_backend
+
+        requested = os.getenv("JARVIS_VAD_BACKEND", "silero").strip().lower()
+        silero_threshold = self._float_env("JARVIS_SILERO_VAD_THRESHOLD", 0.5)
+        lite_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 700.0)
+
+        if requested == "lite":
+            backend = LiteVadBackend(rms_threshold=lite_threshold)
+            self.logger.log("vad_backend_selected", {"backend": "lite", "rms_threshold": lite_threshold})
+            self._vad_backend = backend
+            return backend
+
+        try:
+            backend = SileroVadBackend(threshold=silero_threshold)
+            self.logger.log(
+                "vad_backend_selected",
+                {"backend": "silero", "threshold": silero_threshold},
+            )
+            self._vad_backend = backend
+            return backend
+        except Exception as exc:
+            self.logger.log("voice_error", {"stage": "vad_init", "error": str(exc)})
+            self.on_error("Silero VAD недоступен, переключаюсь на VAD-lite")
+            backend = LiteVadBackend(rms_threshold=lite_threshold)
+            self.logger.log(
+                "vad_backend_selected",
+                {
+                    "backend": "lite",
+                    "fallback": "silero_init_failed",
+                    "rms_threshold": lite_threshold,
+                },
+            )
+            self._vad_backend = backend
+            return backend
+
     def _capture_and_transcribe(
         self,
-        vad,
+        vad: VadBackend,
         whisper_model,
         start_timeout: float,
         silence_ms: int,
