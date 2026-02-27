@@ -14,23 +14,26 @@ from jarvis_assistant.ollama_client import OllamaClient
 from jarvis_assistant.ui import JarvisApp
 
 
+
 def ensure_ollama_running(host: str) -> None:
-    """
-    Ensure Ollama is reachable; if not, try to start `ollama serve` automatically.
-    Works on Windows; does nothing if Ollama is already running.
-    """
+    host = host.rstrip("/")
+
+    # ВАЖНО: игнорируем прокси/Hiddify для localhost
+    s = requests.Session()
+    s.trust_env = False
+
     def healthy() -> bool:
         try:
-            # /api/tags is what your health_check uses too
-            r = requests.get(f"{host.rstrip('/')}/api/tags", timeout=1.5)
+            r = s.get(f"{host}/api/tags", timeout=1.5)
             return r.ok
         except Exception:
             return False
 
+    # Уже работает?
     if healthy():
         return
 
-    # Try to start Ollama in background (no console window on Windows)
+    # Пробуем запустить
     try:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         subprocess.Popen(
@@ -40,22 +43,20 @@ def ensure_ollama_running(host: str) -> None:
             creationflags=creationflags,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError(
-            "Ollama не установлена или не найдена в PATH. Установи Ollama и перезапусти программу."
-        ) from exc
+        raise RuntimeError("Не найден 'ollama' в PATH. Проверь, что Ollama установлена и доступна из терминала.") from exc
     except Exception as exc:
-        raise RuntimeError(f"Не удалось запустить Ollama автоматически: {exc}") from exc
+        raise RuntimeError(f"Не удалось запустить 'ollama serve': {exc}") from exc
 
-    # Wait for Ollama to come up
-    for _ in range(20):  # ~10 seconds max
+    # Ждём дольше (иногда поднимается медленно)
+    for _ in range(60):  # до ~30 секунд
         if healthy():
             return
         time.sleep(0.5)
 
     raise RuntimeError(
-        f"Не удалось подключиться к Ollama ({host}). Проверь, что Ollama установлена и не блокируется фаерволом."
+        f"Не удалось подключиться к Ollama ({host}). "
+        "Проверь: Ollama установлена, порт 11434 слушается, и Hiddify/VPN не ломает localhost."
     )
-
 
 def main() -> None:
     # Auto-start Ollama if needed
