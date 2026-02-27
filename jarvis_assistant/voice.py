@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import json
 import os
+import queue
 import re
 import threading
 import time
 from typing import Callable
+
+import numpy as np
 
 from jarvis_assistant.assistant_core import JarvisAssistant
 from jarvis_assistant.logger import JsonlLogger
 
 
 class VoiceController:
-    WAKE_ALIASES = ("джарвис", "джарвиз", "жарвис", "jarvis")
+    SAMPLE_RATE = 16000
+    CHANNELS = 1
 
     def __init__(
         self,
@@ -36,11 +39,14 @@ class VoiceController:
         self._stop_event = threading.Event()
         self._tts_lock = threading.Lock()
         self._tts_engine = None
+        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
+        self._volume_0_1 = self._read_volume_from_env()
 
     def start(self) -> None:
         if self.is_running():
             return
         self._stop_event.clear()
+        self._clear_audio_queue()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="voice-loop")
         self._thread.start()
 
@@ -51,164 +57,300 @@ class VoiceController:
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def set_volume(self, volume_0_1: float) -> None:
+        self._volume_0_1 = min(1.0, max(0.0, float(volume_0_1)))
+
     def speak(self, text: str) -> None:
         cleaned = sanitize_for_tts(text)
         if not cleaned:
             return
+        if self._stop_event.is_set():
+            return
+
+        self.on_status("Speaking")
+        self.logger.log("tts_started", {"text": cleaned})
         try:
-            self._speak_internal(cleaned)
+            with self._tts_lock:
+                if self._stop_event.is_set():
+                    return
+                engine = self._init_tts_engine()
+                if engine is None:
+                    return
+
+                engine.stop()
+                engine.setProperty("volume", self._volume_0_1)
+                engine.say(cleaned)
+                run_error: Exception | None = None
+
+                def _run_and_wait() -> None:
+                    nonlocal run_error
+                    try:
+                        engine.runAndWait()
+                    except Exception as exc:  # pragma: no cover - depends on TTS backend
+                        run_error = exc
+
+                worker = threading.Thread(target=_run_and_wait, daemon=True, name="tts-runner")
+                worker.start()
+                worker.join(timeout=8)
+
+                if worker.is_alive():
+                    self.logger.log("voice_error", {"stage": "tts", "error": "runAndWait timeout"})
+                    engine.stop()
+                    self._tts_engine = None
+                    return
+                if run_error is not None:
+                    self.logger.log("voice_error", {"stage": "tts", "error": str(run_error)})
+                    engine.stop()
+                    self._tts_engine = None
+                    return
         except Exception as exc:
             self.logger.log("voice_error", {"stage": "tts", "error": str(exc)})
             self.on_error(f"Ошибка синтеза речи: {exc}")
         finally:
-            self.on_status("Listening" if self.is_running() else "Idle")
+            self.logger.log("tts_finished", {"text": cleaned})
+            self.on_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
 
     def _run_loop(self) -> None:
         try:
-            import speech_recognition as sr
-        except Exception as exc:
-            self._fatal_voice_error(f"Voice mode недоступен: не установлен speech_recognition ({exc}).")
-            return
+            import sounddevice as sd
+            import webrtcvad
+            from faster_whisper import WhisperModel
+            from openwakeword.model import Model
 
-        recognizer = sr.Recognizer()
-        recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold = 1.0
-        recognizer.non_speaking_duration = 0.5
-        energy_override = os.getenv("JARVIS_STT_ENERGY_THRESHOLD")
-        if energy_override:
-            try:
-                recognizer.energy_threshold = max(1, int(float(energy_override)))
-                recognizer.dynamic_energy_threshold = False
-            except ValueError:
-                self.logger.log(
-                    "voice_error",
-                    {
-                        "stage": "stt_config",
-                        "error": f"Invalid JARVIS_STT_ENERGY_THRESHOLD: {energy_override}",
-                    },
-                )
+            wake_model_path = os.getenv("JARVIS_WAKE_MODEL_PATH", "").strip()
+            wake_model = Model(wakeword_models=[wake_model_path]) if wake_model_path else Model()
+            wake_model_name = wake_model_path or "hey_jarvis"
+            self.logger.log(
+                "wake_backend_selected",
+                {"backend": "openwakeword", "model": wake_model_name},
+            )
 
-        try:
-            with sr.Microphone() as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.6)
+            wake_threshold = self._float_env("JARVIS_WAKE_THRESHOLD", 0.65)
+            wake_cooldown = self._float_env("JARVIS_WAKE_COOLDOWN", 2.0)
+            vad_mode = self._int_env("JARVIS_VAD_MODE", 2, min_value=0, max_value=3)
+            start_timeout = self._float_env("JARVIS_COMMAND_START_TIMEOUT", 3.0)
+            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1000, min_value=200, max_value=3000)
+            max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
+            whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
+            beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
+
+            vad = webrtcvad.Vad(vad_mode)
+            whisper_model = WhisperModel(whisper_model_name, device="cpu", compute_type="int8")
+            device = self._resolve_audio_device(sd)
+
+            def audio_callback(indata, frames, callback_time, status) -> None:
+                del frames, callback_time
+                if status:
+                    self.logger.log("voice_error", {"stage": "audio_callback", "error": str(status)})
+                chunk = np.copy(indata[:, 0]).astype(np.int16)
+                try:
+                    self._audio_queue.put_nowait(chunk)
+                except queue.Full:
+                    try:
+                        self._audio_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._audio_queue.put_nowait(chunk)
+
+            with sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype="int16",
+                callback=audio_callback,
+                blocksize=320,
+                device=device,
+            ):
+                self.logger.log("voice_started", {})
                 self.on_status("Listening")
+                consecutive_hits = 0
+                cooldown_until = 0.0
                 while not self._stop_event.is_set():
-                    text = self._listen_for_wake_word(recognizer, source)
-                    if not text:
-                        continue
-                    if not self._contains_wake_word(text):
+                    chunk = self._next_chunk(timeout=0.2)
+                    if chunk is None:
                         continue
 
-                    self.logger.log("wake_word_detected", {"text": text})
+                    if time.monotonic() < cooldown_until:
+                        continue
+
+                    score, score_model_name = self._wake_score(wake_model, chunk, wake_model_name)
+                    if score >= wake_threshold:
+                        consecutive_hits += 1
+                    else:
+                        consecutive_hits = 0
+
+                    if consecutive_hits < 3:
+                        continue
+
+                    consecutive_hits = 0
+                    cooldown_until = time.monotonic() + wake_cooldown
+                    self.logger.log(
+                        "wake_word_detected",
+                        {
+                            "score": round(score, 4),
+                            "threshold": wake_threshold,
+                            "model": score_model_name,
+                        },
+                    )
                     self.on_status("Heard wake word")
 
                     if self.is_busy():
-                        self._speak_internal("Подожди секунду")
-                        self.on_status("Listening")
+                        self.speak("Подожди секунду")
                         continue
 
-                    self._speak_internal("Слушаю")
-                    command = self._listen_for_command(recognizer, source)
-                    if not command:
-                        self._speak_internal("Да?")
-                        command = self._listen_for_command(recognizer, source)
-                        if not command:
-                            self.logger.log("command_not_heard", {"attempts": 2})
+                    self.speak("Слушаю")
+                    command = self._capture_and_transcribe(
+                        vad=vad,
+                        whisper_model=whisper_model,
+                        start_timeout=start_timeout,
+                        silence_ms=silence_ms,
+                        max_sec=max_sec,
+                        beam_size=beam_size,
+                    )
+                    if not command and not self._stop_event.is_set():
+                        self.speak("Да?")
+                        command = self._capture_and_transcribe(
+                            vad=vad,
+                            whisper_model=whisper_model,
+                            start_timeout=start_timeout,
+                            silence_ms=silence_ms,
+                            max_sec=max_sec,
+                            beam_size=beam_size,
+                        )
 
                     if command:
                         self.logger.log("stt_text", {"text": command})
                         self.on_user_text(command)
                     self.on_status("Listening")
-        except OSError as exc:
-            self._fatal_voice_error(f"Не удалось получить доступ к микрофону: {exc}")
-            return
+
         except Exception as exc:
-            self._fatal_voice_error(f"Ошибка voice loop: {exc}")
-            return
+            self.logger.log("voice_error", {"stage": "voice_loop", "error": str(exc)})
+            self.on_error(f"Ошибка voice loop: {exc}")
         finally:
+            self._stop_event.set()
+            self.logger.log("voice_stopped", {})
             self.on_status("Idle")
             if self.on_stopped:
                 self.on_stopped()
 
-    def _listen_for_wake_word(self, recognizer, source) -> str | None:
-        try:
-            audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
-        except Exception as exc:
-            self._log_stt_error(stage="wake_word", exc=exc)
-            return None
-        return self._recognize_ru(recognizer, audio, stage="wake_word")
+    def _capture_and_transcribe(
+        self,
+        vad,
+        whisper_model,
+        start_timeout: float,
+        silence_ms: int,
+        max_sec: float,
+        beam_size: int,
+    ) -> str | None:
+        frame_samples = 320
+        frame_bytes = frame_samples * 2
+        start_deadline = time.monotonic() + start_timeout
+        silence_frames_limit = max(1, int(silence_ms / 20))
 
-    def _listen_for_command(self, recognizer, source) -> str | None:
+        collected = np.empty(0, dtype=np.int16)
+        speech_started = False
+        silence_frames = 0
+        speech_start_ts = 0.0
+        speech_frames: list[np.ndarray] = []
+
+        while not self._stop_event.is_set():
+            timeout = 0.3 if speech_started else max(0.1, start_deadline - time.monotonic())
+            chunk = self._next_chunk(timeout=timeout)
+            if chunk is None:
+                if not speech_started and time.monotonic() > start_deadline:
+                    return None
+                continue
+
+            collected = np.concatenate((collected, chunk))
+            while collected.size >= frame_samples:
+                frame = collected[:frame_samples]
+                collected = collected[frame_samples:]
+                if len(frame.tobytes()) != frame_bytes:
+                    continue
+                speech = vad.is_speech(frame.tobytes(), self.SAMPLE_RATE)
+                if speech:
+                    if not speech_started:
+                        speech_started = True
+                        speech_start_ts = time.monotonic()
+                        self.logger.log("vad_start", {})
+                    silence_frames = 0
+                elif speech_started:
+                    silence_frames += 1
+
+                if speech_started:
+                    speech_frames.append(frame.copy())
+
+                if speech_started and silence_frames >= silence_frames_limit:
+                    duration_ms = int((time.monotonic() - speech_start_ts) * 1000)
+                    self.logger.log("vad_end", {"duration_ms": duration_ms})
+                    return self._transcribe_audio(whisper_model, frames=speech_frames, beam_size=beam_size)
+
+                if speech_started and (time.monotonic() - speech_start_ts) >= max_sec:
+                    duration_ms = int((time.monotonic() - speech_start_ts) * 1000)
+                    self.logger.log("vad_end", {"duration_ms": duration_ms})
+                    return self._transcribe_audio(whisper_model, frames=speech_frames, beam_size=beam_size)
+
+        return None
+
+    def _transcribe_audio(self, whisper_model, frames: list[np.ndarray], beam_size: int) -> str | None:
+        if self._stop_event.is_set() or not frames:
+            return None
+        try:
+            frame_buffer = np.concatenate(frames).astype(np.int16, copy=False)
+            audio_float = frame_buffer.astype(np.float32) / 32768.0
+            segments, _ = whisper_model.transcribe(audio_float, language="ru", beam_size=beam_size)
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            if text:
+                return text
+            self.speak("Не расслышал")
+            return None
+        except Exception as exc:
+            self.logger.log("voice_error", {"stage": "transcribe", "error": str(exc)})
+            self.on_error(f"Ошибка распознавания речи: {exc}")
+            return None
+
+    def _wake_score(self, wake_model, chunk: np.ndarray, fallback_name: str) -> tuple[float, str]:
+        prediction = wake_model.predict(chunk)
+        if not isinstance(prediction, dict) or not prediction:
+            return 0.0, fallback_name
+
+        if "hey_jarvis" in prediction:
+            return float(prediction["hey_jarvis"]), "hey_jarvis"
+
+        best_name, best_score = max(prediction.items(), key=lambda item: float(item[1]))
+        return float(best_score), str(best_name)
+
+    def _next_chunk(self, timeout: float) -> np.ndarray | None:
         if self._stop_event.is_set():
             return None
         try:
-            audio = recognizer.listen(source, timeout=6, phrase_time_limit=12)
-        except Exception as exc:
-            self._log_stt_error(stage="command", exc=exc)
+            return self._audio_queue.get(timeout=max(0.01, timeout))
+        except queue.Empty:
             return None
-        return self._recognize_ru(recognizer, audio, stage="command")
 
-    def _recognize_ru(self, recognizer, audio, stage: str) -> str | None:
+    def _clear_audio_queue(self) -> None:
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _resolve_audio_device(self, sd):
+        value = os.getenv("JARVIS_AUDIO_DEVICE", "").strip()
+        if not value:
+            return None
+        if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+            return int(value)
+
         try:
-            text = recognizer.recognize_google(audio, language="ru-RU")
-            return text.strip()
+            devices = sd.query_devices()
+            for idx, item in enumerate(devices):
+                name = str(item.get("name", ""))
+                max_input = int(item.get("max_input_channels", 0))
+                if max_input > 0 and value.lower() in name.lower():
+                    return idx
         except Exception as exc:
-            err_name = self._log_stt_error(stage=stage, exc=exc)
-            if err_name == "RequestError":
-                self.on_error("Ошибка STT: проверь интернет-соединение для распознавания речи.")
-                time.sleep(1)
-            return None
-
-    @classmethod
-    def _contains_wake_word(cls, text: str) -> bool:
-        lowered = text.lower()
-        return any(alias in lowered for alias in cls.WAKE_ALIASES)
-
-    def _speak_internal(self, text: str) -> None:
-        if self._stop_event.is_set():
-            return
-        self.on_status("Speaking")
-        self.logger.log("tts_started", {"text": text})
-        with self._tts_lock:
-            engine = self._init_tts_engine()
-            if engine is None:
-                self.logger.log("tts_error", {"reason": "pyttsx3 init failed"})
-                return
-
-            engine.stop()
-            engine.say(text)
-            run_error: Exception | None = None
-
-            def _run_and_wait() -> None:
-                nonlocal run_error
-                try:
-                    engine.runAndWait()
-                except Exception as exc:
-                    run_error = exc
-
-            worker = threading.Thread(target=_run_and_wait, daemon=True, name="tts-runner")
-            worker.start()
-            worker.join(timeout=8)
-
-            if worker.is_alive():
-                self.logger.log("tts_error", {"reason": "runAndWait timeout", "timeout_s": 8})
-                try:
-                    engine.stop()
-                except Exception:
-                    pass
-                self._tts_engine = None
-                return
-
-            if run_error is not None:
-                self.logger.log("tts_error", {"reason": "runAndWait failed", "error": str(run_error)})
-                try:
-                    engine.stop()
-                except Exception:
-                    pass
-                self._tts_engine = None
-                return
-
-        self.logger.log("tts_finished", {"text": text})
+            self.logger.log("voice_error", {"stage": "audio_device", "error": str(exc)})
+        return None
 
     def _init_tts_engine(self):
         if self._tts_engine is not None:
@@ -219,7 +361,7 @@ class VoiceController:
             self._tts_engine = pyttsx3.init()
             return self._tts_engine
         except Exception as exc:
-            self.logger.log("tts_error", {"reason": "pyttsx3 init exception", "error": str(exc)})
+            self.logger.log("voice_error", {"stage": "tts_init", "error": str(exc)})
             self._tts_engine = None
             return None
 
@@ -228,22 +370,42 @@ class VoiceController:
             if self._tts_engine is not None:
                 self._tts_engine.stop()
 
-    def _fatal_voice_error(self, message: str) -> None:
-        self.logger.log("voice_error", {"stage": "fatal", "error": message})
-        self.on_error(message)
-        self._stop_event.set()
+    @staticmethod
+    def _read_volume_from_env() -> float:
+        raw = os.getenv("JARVIS_TTS_VOLUME", "0.8").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.8
+        if value > 1.0:
+            value = value / 100.0
+        return max(0.0, min(1.0, value))
 
-    def _log_stt_error(self, stage: str, exc: Exception) -> str:
-        err_name = exc.__class__.__name__
-        self.logger.log(
-            "stt_error",
-            {
-                "stage": stage,
-                "error": err_name,
-                "details": str(exc),
-            },
-        )
-        return err_name
+    def _float_env(self, key: str, default: float) -> float:
+        raw = os.getenv(key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            self.logger.log("voice_error", {"stage": "config", "error": f"Invalid {key}={raw}"})
+            return default
+
+    def _int_env(self, key: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+        raw = os.getenv(key)
+        if raw is None:
+            value = default
+        else:
+            try:
+                value = int(float(raw))
+            except ValueError:
+                self.logger.log("voice_error", {"stage": "config", "error": f"Invalid {key}={raw}"})
+                value = default
+        if min_value is not None:
+            value = max(min_value, value)
+        if max_value is not None:
+            value = min(max_value, value)
+        return value
 
 
 def sanitize_for_tts(text: str, max_len: int = 500) -> str:
@@ -254,12 +416,6 @@ def sanitize_for_tts(text: str, max_len: int = 500) -> str:
     cleaned = re.sub(r"\{.*?\}", "", cleaned, flags=re.DOTALL)
     cleaned = re.sub(r"\[.*?\]", "", cleaned, flags=re.DOTALL)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    if cleaned.startswith("{") or cleaned.startswith("["):
-        try:
-            json.loads(cleaned)
-            return ""
-        except Exception:
-            pass
-
-    return cleaned[:max_len].strip()
+    if not cleaned:
+        return ""
+    return cleaned[:max_len]
