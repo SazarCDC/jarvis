@@ -158,12 +158,27 @@ class VoiceController:
             from faster_whisper import WhisperModel
             from openwakeword.model import Model
 
-            wake_model_path = os.getenv("JARVIS_WAKE_MODEL_PATH", "").strip()
-            wake_model = Model(wakeword_models=[wake_model_path]) if wake_model_path else Model()
-            wake_model_name = wake_model_path or "hey_jarvis"
+            wake_backend = (os.getenv("JARVIS_WAKE_BACKEND", "onnx").strip().lower() or "onnx")
+            wake_model_name = os.getenv("JARVIS_WAKE_MODEL", "hey_jarvis").strip() or "hey_jarvis"
+            if wake_backend != "onnx":
+                self.logger.log(
+                    "voice_error",
+                    {"stage": "wake_init", "error": f"Unsupported wake backend: {wake_backend}"},
+                )
+                self.on_error("Wake word недоступен: требуется onnxruntime")
+                return
+            try:
+                wake_model = Model(
+                    inference_framework="onnx",
+                    wakeword_models=[wake_model_name],
+                )
+            except Exception as exc:
+                self.logger.log("voice_error", {"stage": "wake_init", "error": str(exc)})
+                self.on_error("Wake word недоступен: требуется onnxruntime")
+                return
             self.logger.log(
                 "wake_backend_selected",
-                {"backend": "openwakeword", "model": wake_model_name},
+                {"backend": "openwakeword", "framework": wake_backend, "model": wake_model_name},
             )
 
             wake_threshold = self._float_env("JARVIS_WAKE_THRESHOLD", 0.65)

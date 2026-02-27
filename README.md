@@ -5,7 +5,7 @@
 ## Возможности
 
 - Диалоговый интерфейс в одном окне (история, ввод, Execute/Send, STOP, статусы `Idle/Listening/Heard wake word/Thinking/Acting/Speaking`).
-- Полностью оффлайн voice mode: wake word через `openWakeWord` (модель `hey_jarvis`), STT через `faster-whisper`, VAD через Silero (`torch`) с fallback на VAD-lite, TTS через `pyttsx3`.
+- Полностью оффлайн voice mode: wake word через `openWakeWord` (модель `hey_jarvis`) **только через ONNX backend**, STT через `faster-whisper`, VAD через Silero (`torch`) с fallback на VAD-lite, TTS через `pyttsx3`.
 - Подключение к локальной Ollama по HTTP API (`/api/chat`).
 - Health-check при старте (HEAD `/` и fallback на `GET /api/tags`) с понятной ошибкой.
 - LLM всегда должна возвращать JSON-решение:
@@ -67,7 +67,8 @@ python main.py
 
 - `JARVIS_WAKE_THRESHOLD` (default `0.65`)
 - `JARVIS_WAKE_COOLDOWN` (default `2.0`)
-- `JARVIS_WAKE_MODEL_PATH` (optional, путь к кастомной wake модели)
+- `JARVIS_WAKE_BACKEND` (default `onnx`; другие значения не поддерживаются)
+- `JARVIS_WAKE_MODEL` (default `hey_jarvis`)
 - `JARVIS_VAD_BACKEND` (`silero|lite`, default `silero`)
 - `JARVIS_SILERO_VAD_THRESHOLD` (default `0.5`)
 - `JARVIS_VAD_RMS_THRESHOLD` (default `700`)
@@ -78,6 +79,13 @@ python main.py
 - `JARVIS_WHISPER_BEAM_SIZE` (default `1`, диапазон `1..3`)
 - `JARVIS_AUDIO_DEVICE` (optional: индекс или подстрока имени устройства ввода)
 - `JARVIS_TTS_VOLUME` (default `0.8`; можно задавать как `0..1` или `0..100`)
+
+
+### Ограничение для Windows + Python 3.12
+
+- `tflite-runtime` не поддерживается для Windows + Python 3.12 в этом проекте.
+- Wake word работает только через ONNX (`openWakeWord` + `onnxruntime`).
+- Никакие cloud/internet STT сервисы не используются: распознавание выполняется локально через `faster-whisper`.
 
 ### Troubleshooting
 
