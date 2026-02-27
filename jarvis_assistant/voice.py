@@ -53,8 +53,8 @@ class VoiceController:
         self._porcupine_sensitivity = min(1.0, max(0.0, self._float_env("JARVIS_PORCUPINE_SENSITIVITY", 0.7)))
         self._wake_debug = self._int_env("JARVIS_WAKE_DEBUG", 0) == 1
         self._wake_cooldown_sec = max(0.0, self._float_env("JARVIS_WAKE_COOLDOWN", 1.0))
-        self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 350))
-        self._command_start_timeout = max(0.3, self._float_env("JARVIS_COMMAND_START_TIMEOUT", 3.5))
+        self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 150))
+        self._command_start_timeout = max(0.3, self._float_env("JARVIS_COMMAND_START_TIMEOUT", 6.0))
         self._wake_earcon_enabled = self._int_env("JARVIS_WAKE_EARCON", 1) == 1
         self._wake_earcon_freq = self._float_env("JARVIS_WAKE_EARCON_FREQ", 880.0)
         self._wake_earcon_ms = self._int_env("JARVIS_WAKE_EARCON_MS", 70, min_value=20, max_value=250)
@@ -183,9 +183,9 @@ class VoiceController:
                 self.on_error("Wake word недоступен: файл .ppn не найден")
                 return
 
-            command_max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
-            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1200, min_value=300, max_value=3000)
-            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 350.0)
+            command_max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 15.0)
+            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1400, min_value=300, max_value=3000)
+            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 300.0)
             whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
             beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
             device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
@@ -266,30 +266,8 @@ class VoiceController:
                 self._set_status("Heard wake word")
 
                 if self.is_busy():
-                    self.speak("Подожди секунду")
+                    self.logger.log("wake_word_ignored_busy", {})
                     continue
-
-                self.wait_for_tts_idle(timeout_sec=1.5)
-
-                recorder_stopped = False
-                try:
-                    recorder.stop()
-                    recorder_stopped = True
-                except Exception as exc:
-                    self.logger.log("voice_error", {"stage": "recorder_stop", "error": str(exc)})
-
-                if self._wake_earcon_enabled:
-                    self._play_wake_earcon()
-
-                if self._wake_post_tts_silence_ms > 0:
-                    time.sleep(self._wake_post_tts_silence_ms / 1000.0)
-
-                if recorder_stopped:
-                    try:
-                        recorder.start()
-                    except Exception as exc:
-                        self.logger.log("voice_error", {"stage": "recorder_start", "error": str(exc)})
-                        continue
 
                 self._flush_audio(recorder, self._command_pre_roll_ms)
                 command = self._capture_and_transcribe(
@@ -301,11 +279,11 @@ class VoiceController:
                     beam_size=beam_size,
                     start_timeout_sec=self._command_start_timeout,
                 )
-                if not command and not self._stop_event.is_set():
-                    self.speak("Да?")
                 if command:
                     self.logger.log("stt_text", {"text": command})
                     self.on_user_text(command)
+                elif not self._stop_event.is_set():
+                    self.logger.log("stt_empty", {})
 
                 if not self._stop_event.is_set():
                     self._set_status("Listening")
