@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import queue
 import re
+import shutil
+import subprocess
 import threading
 import time
+import wave
 from typing import Callable
 
 import numpy as np
@@ -38,13 +41,12 @@ class VoiceController:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
-        self._tts_queue: queue.Queue[str | tuple[str, float] | None] = queue.Queue()
+        self._tts_queue: queue.Queue[str | None] = queue.Queue()
         self._tts_thread: threading.Thread | None = None
-        self._tts_stop = threading.Event()
-        self._tts_engine = None
+        self._tts_stop_event = threading.Event()
+        self._tts_backend: PiperTTS | None = None
         self._volume_0_1 = self._read_volume_from_env()
-        self._tts_ready = threading.Event()
-        self._tts_watchdog_sec = self._float_env("JARVIS_TTS_WATCHDOG_SEC", 20.0)
+        self._tts_rate = self._float_env("JARVIS_TTS_RATE", 1.0)
         self._status_lock = threading.Lock()
         self._current_status = "Idle"
 
@@ -73,26 +75,28 @@ class VoiceController:
     def start_tts(self) -> None:
         if self._tts_thread and self._tts_thread.is_alive():
             return
-        self._tts_stop.clear()
-        self._tts_ready.clear()
+        self._tts_stop_event.clear()
+        self._tts_backend = PiperTTS(
+            logger=self.logger,
+            on_error=self.on_error,
+            stop_event=self._tts_stop_event,
+            volume_0_1=self._volume_0_1,
+            rate=self._tts_rate,
+        )
         self._tts_thread = threading.Thread(target=self._tts_loop, daemon=True, name="tts-loop")
         self._tts_thread.start()
 
     def stop_tts(self) -> None:
-        self._tts_stop.set()
+        self._tts_stop_event.set()
+        if self._tts_backend is not None:
+            self._tts_backend.stop_playback()
         self._clear_tts_queue()
-        self._enqueue_tts(("__STOP__", 0.0))
-        if self._tts_engine is not None:
-            try:
-                self._tts_engine.stop()
-            except Exception as exc:
-                self.logger.log("tts_error", {"error": str(exc), "stage": "stop"})
         self._enqueue_tts(None)
 
     def set_volume(self, volume_0_1: float) -> None:
         self._volume_0_1 = min(1.0, max(0.0, float(volume_0_1)))
-        self.start_tts()
-        self._enqueue_tts(("__SET_VOLUME__", self._volume_0_1))
+        if self._tts_backend is not None:
+            self._tts_backend.set_volume(self._volume_0_1)
 
     def speak(self, text: str) -> None:
         cleaned = sanitize_for_tts(text)
@@ -101,7 +105,7 @@ class VoiceController:
         self.start_tts()
         self._enqueue_tts(cleaned)
 
-    def _enqueue_tts(self, item: str | tuple[str, float] | None) -> None:
+    def _enqueue_tts(self, item: str | None) -> None:
         try:
             self._tts_queue.put_nowait(item)
         except queue.Full:
@@ -115,47 +119,27 @@ class VoiceController:
                 break
 
     def _tts_loop(self) -> None:
-        engine = None
         try:
-            import pyttsx3
+            if self._tts_backend is None:
+                return
 
-            engine = pyttsx3.init()
-            engine.setProperty("volume", self._volume_0_1)
-            self._tts_engine = engine
-            self._tts_ready.set()
-
-            while not self._tts_stop.is_set():
+            while not self._tts_stop_event.is_set():
                 item = self._tts_queue.get()
                 if item is None:
                     break
-
-                if isinstance(item, tuple) and item[0] == "__SET_VOLUME__":
-                    try:
-                        engine.setProperty("volume", float(item[1]))
-                    except Exception as exc:
-                        self.logger.log("tts_error", {"error": str(exc), "stage": "set_volume"})
+                if not isinstance(item, str):
                     continue
 
-                if isinstance(item, tuple) and item[0] == "__STOP__":
-                    try:
-                        engine.stop()
-                    except Exception as exc:
-                        self.logger.log("tts_error", {"error": str(exc), "stage": "stop"})
-                    continue
-
-                text = str(item)
-                started_at = time.monotonic()
+                text = item
                 try:
                     self._set_status("Speaking")
                     self.logger.log("tts_started", {"text": text[:120]})
-                    engine.stop()
-                    engine.say(text)
-                    engine.runAndWait()
-                    if time.monotonic() - started_at > self._tts_watchdog_sec:
-                        self.logger.log(
-                            "tts_watchdog_timeout",
-                            {"duration_sec": round(time.monotonic() - started_at, 2), "text": text[:120]},
-                        )
+                    audio, sample_rate = self._tts_backend.synthesize(text)
+                    if audio is None:
+                        continue
+                    self._tts_backend.play(audio=audio, sample_rate=sample_rate)
+                    if self._tts_stop_event.is_set():
+                        break
                     self.logger.log("tts_finished", {"text": text[:120]})
                 except Exception as exc:
                     self.logger.log("tts_error", {"error": str(exc)})
@@ -165,13 +149,9 @@ class VoiceController:
             self.logger.log("tts_error", {"error": str(exc), "stage": "init"})
             self.on_error(f"Ошибка синтеза речи: {exc}")
         finally:
-            self._tts_engine = None
-            self._tts_ready.clear()
-            try:
-                if engine is not None:
-                    engine.stop()
-            except Exception:
-                pass
+            if self._tts_backend is not None:
+                self._tts_backend.stop_playback()
+            self._tts_backend = None
 
     def _run_loop(self) -> None:
         recorder = None
@@ -464,3 +444,164 @@ def sanitize_for_tts(text: str, max_len: int = 500) -> str:
     if not cleaned:
         return ""
     return cleaned[:max_len]
+
+
+class PiperTTS:
+    def __init__(
+        self,
+        logger: JsonlLogger,
+        on_error: Callable[[str], None],
+        stop_event: threading.Event,
+        volume_0_1: float,
+        rate: float,
+    ) -> None:
+        self.logger = logger
+        self.on_error = on_error
+        self.stop_event = stop_event
+        self._volume_0_1 = volume_0_1
+        self._rate = rate
+        self._playback_lock = threading.Lock()
+        self._current_stream = None
+
+        self._backend = os.getenv("JARVIS_TTS_BACKEND", "piper").strip().lower() or "piper"
+        self._model_path = os.getenv("JARVIS_PIPER_MODEL_PATH", "").strip()
+        self._piper_exe_path = os.getenv("JARVIS_PIPER_EXE_PATH", "").strip() or shutil.which("piper")
+        self._python_voice = None
+        self._available = False
+        self._default_sample_rate = 22050
+        self._init_backend()
+
+    def _init_backend(self) -> None:
+        if self._backend != "piper":
+            self.on_error(f"TTS недоступен: неподдерживаемый backend {self._backend}")
+            return
+        if not self._model_path:
+            self.on_error("TTS недоступен: не задан JARVIS_PIPER_MODEL_PATH")
+            return
+        if not os.path.isfile(self._model_path):
+            self.on_error(f"TTS недоступен: модель Piper не найдена: {self._model_path}")
+            return
+
+        self._python_voice = self._load_python_piper_voice()
+        if self._python_voice is not None:
+            self._available = True
+            self.logger.log("tts_backend_selected", {"backend": "piper_python"})
+            return
+
+        if self._piper_exe_path and os.path.isfile(self._piper_exe_path):
+            self._available = True
+            self.logger.log("tts_backend_selected", {"backend": "piper_subprocess", "exe": self._piper_exe_path})
+            return
+
+        self.on_error("TTS недоступен: не найден piper-tts и не задан JARVIS_PIPER_EXE_PATH")
+
+    def _load_python_piper_voice(self):
+        try:
+            from piper.voice import PiperVoice
+
+            config_path = f"{self._model_path}.json"
+            kwargs = {"model_path": self._model_path}
+            if os.path.isfile(config_path):
+                kwargs["config_path"] = config_path
+            voice = PiperVoice.load(**kwargs)
+            sample_rate = getattr(voice.config, "sample_rate", None)
+            if isinstance(sample_rate, int) and sample_rate > 1000:
+                self._default_sample_rate = sample_rate
+            return voice
+        except Exception as exc:
+            self.logger.log("tts_error", {"stage": "piper_python_init", "error": str(exc)})
+            return None
+
+    def set_volume(self, volume_0_1: float) -> None:
+        self._volume_0_1 = min(1.0, max(0.0, float(volume_0_1)))
+
+    def synthesize(self, text: str) -> tuple[np.ndarray | None, int]:
+        if not self._available or self.stop_event.is_set():
+            return None, self._default_sample_rate
+
+        if self._python_voice is not None:
+            try:
+                pcm_chunks = []
+                for chunk in self._python_voice.synthesize_stream_raw(
+                    text,
+                    speaker_id=None,
+                    length_scale=1.0 / max(self._rate, 0.2),
+                ):
+                    if self.stop_event.is_set():
+                        return None, self._default_sample_rate
+                    pcm_chunks.append(chunk)
+                if not pcm_chunks:
+                    return None, self._default_sample_rate
+                audio = np.frombuffer(b"".join(pcm_chunks), dtype=np.int16).copy()
+                return audio, self._default_sample_rate
+            except Exception as exc:
+                self.logger.log("tts_error", {"stage": "piper_python_synthesize", "error": str(exc)})
+                self.on_error(f"Ошибка Piper TTS: {exc}")
+                return None, self._default_sample_rate
+
+        wav_path = os.path.join(os.getenv("TEMP", "."), f"jarvis_tts_{int(time.time() * 1000)}.wav")
+        cmd = [self._piper_exe_path, "--model", self._model_path, "--output_file", wav_path]
+        cmd.extend(["--length_scale", str(1.0 / max(self._rate, 0.2))])
+        try:
+            result = subprocess.run(
+                cmd,
+                input=text,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "piper returned non-zero exit code").strip())
+            with wave.open(wav_path, "rb") as wav_file:
+                sample_rate = wav_file.getframerate()
+                samples = wav_file.readframes(wav_file.getnframes())
+            return np.frombuffer(samples, dtype=np.int16).copy(), sample_rate
+        except Exception as exc:
+            self.logger.log("tts_error", {"stage": "piper_subprocess_synthesize", "error": str(exc)})
+            self.on_error(f"Ошибка Piper TTS: {exc}")
+            return None, self._default_sample_rate
+        finally:
+            try:
+                if os.path.isfile(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+
+    def play(self, audio: np.ndarray, sample_rate: int) -> None:
+        if self.stop_event.is_set() or audio.size == 0:
+            return
+        try:
+            import sounddevice as sd
+
+            scaled = np.clip(audio.astype(np.float32) * self._volume_0_1, -32768, 32767).astype(np.int16)
+            with self._playback_lock:
+                self._current_stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+                self._current_stream.start()
+                self._current_stream.write(scaled)
+                self._current_stream.stop()
+                self._current_stream.close()
+                self._current_stream = None
+        except Exception as exc:
+            self.logger.log("tts_error", {"stage": "playback", "error": str(exc)})
+            self.on_error(f"Ошибка воспроизведения TTS: {exc}")
+
+    def stop_playback(self) -> None:
+        self.logger.log("tts_stopped", {})
+        try:
+            import sounddevice as sd
+
+            sd.stop()
+        except Exception:
+            pass
+
+        with self._playback_lock:
+            if self._current_stream is not None:
+                try:
+                    self._current_stream.abort(ignore_errors=True)
+                except Exception:
+                    pass
+                try:
+                    self._current_stream.close(ignore_errors=True)
+                except Exception:
+                    pass
+                self._current_stream = None

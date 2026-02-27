@@ -199,7 +199,7 @@ class JarvisApp(tk.Tk):
 
     @staticmethod
     def _read_volume_percent_from_env() -> int:
-        value = os.getenv("JARVIS_TTS_VOLUME", "0.8").strip()
+        value = os.getenv("JARVIS_TTS_VOLUME", "80").strip()
         try:
             parsed = float(value)
         except ValueError:
