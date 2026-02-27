@@ -20,6 +20,8 @@
   - `keyboard`, `mouse`, `window`
   - `screenshot`, `clipboard`, `browser`, `wait`
 - Логирование в JSONL: input, JSON от LLM, actions, результаты, ошибки, voice-события.
+- STT-тюнинг в voice mode: увеличенные окна распознавания wake word/команды, динамический порог с опциональным `JARVIS_STT_ENERGY_THRESHOLD`, расширенная диагностика `stt_error`/`command_not_heard`.
+- TTS watchdog для `pyttsx3.runAndWait()` (таймаут + восстановление engine), чтобы избежать зависаний озвучки.
 - Память в файлах:
   - `jarvis_assistant/memory/facts.json`
   - `jarvis_assistant/memory/preferences.json`
@@ -46,6 +48,7 @@ pip install -r requirements.txt
 - `JARVIS_MEMORY_DIR` (по умолчанию `jarvis_assistant/memory`)
 - `JARVIS_MAX_HISTORY` (по умолчанию `20`)
 - `JARVIS_COMMAND_TIMEOUT` (по умолчанию `120`)
+- `JARVIS_STT_ENERGY_THRESHOLD` (опционально: фиксированный порог STT; без него используется dynamic energy)
 
 4. Запуск:
 

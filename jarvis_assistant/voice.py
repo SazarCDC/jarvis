@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -70,8 +71,22 @@ class VoiceController:
             return
 
         recognizer = sr.Recognizer()
-        recognizer.pause_threshold = 0.7
-        recognizer.non_speaking_duration = 0.3
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold = 1.0
+        recognizer.non_speaking_duration = 0.5
+        energy_override = os.getenv("JARVIS_STT_ENERGY_THRESHOLD")
+        if energy_override:
+            try:
+                recognizer.energy_threshold = max(1, int(float(energy_override)))
+                recognizer.dynamic_energy_threshold = False
+            except ValueError:
+                self.logger.log(
+                    "voice_error",
+                    {
+                        "stage": "stt_config",
+                        "error": f"Invalid JARVIS_STT_ENERGY_THRESHOLD: {energy_override}",
+                    },
+                )
 
         try:
             with sr.Microphone() as source:
@@ -97,6 +112,8 @@ class VoiceController:
                     if not command:
                         self._speak_internal("Да?")
                         command = self._listen_for_command(recognizer, source)
+                        if not command:
+                            self.logger.log("command_not_heard", {"attempts": 2})
 
                     if command:
                         self.logger.log("stt_text", {"text": command})
@@ -115,8 +132,9 @@ class VoiceController:
 
     def _listen_for_wake_word(self, recognizer, source) -> str | None:
         try:
-            audio = recognizer.listen(source, timeout=2, phrase_time_limit=2)
-        except Exception:
+            audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
+        except Exception as exc:
+            self._log_stt_error(stage="wake_word", exc=exc)
             return None
         return self._recognize_ru(recognizer, audio, stage="wake_word")
 
@@ -124,8 +142,9 @@ class VoiceController:
         if self._stop_event.is_set():
             return None
         try:
-            audio = recognizer.listen(source, timeout=4, phrase_time_limit=10)
-        except Exception:
+            audio = recognizer.listen(source, timeout=6, phrase_time_limit=12)
+        except Exception as exc:
+            self._log_stt_error(stage="command", exc=exc)
             return None
         return self._recognize_ru(recognizer, audio, stage="command")
 
@@ -134,9 +153,8 @@ class VoiceController:
             text = recognizer.recognize_google(audio, language="ru-RU")
             return text.strip()
         except Exception as exc:
-            err_name = exc.__class__.__name__
+            err_name = self._log_stt_error(stage=stage, exc=exc)
             if err_name == "RequestError":
-                self.logger.log("voice_error", {"stage": stage, "error": str(exc)})
                 self.on_error("Ошибка STT: проверь интернет-соединение для распознавания речи.")
                 time.sleep(1)
             return None
@@ -152,14 +170,58 @@ class VoiceController:
         self.on_status("Speaking")
         self.logger.log("tts_started", {"text": text})
         with self._tts_lock:
-            if self._tts_engine is None:
-                import pyttsx3
+            engine = self._init_tts_engine()
+            if engine is None:
+                self.logger.log("tts_error", {"reason": "pyttsx3 init failed"})
+                return
 
-                self._tts_engine = pyttsx3.init()
-            self._tts_engine.stop()
-            self._tts_engine.say(text)
-            self._tts_engine.runAndWait()
+            engine.stop()
+            engine.say(text)
+            run_error: Exception | None = None
+
+            def _run_and_wait() -> None:
+                nonlocal run_error
+                try:
+                    engine.runAndWait()
+                except Exception as exc:
+                    run_error = exc
+
+            worker = threading.Thread(target=_run_and_wait, daemon=True, name="tts-runner")
+            worker.start()
+            worker.join(timeout=8)
+
+            if worker.is_alive():
+                self.logger.log("tts_error", {"reason": "runAndWait timeout", "timeout_s": 8})
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                self._tts_engine = None
+                return
+
+            if run_error is not None:
+                self.logger.log("tts_error", {"reason": "runAndWait failed", "error": str(run_error)})
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+                self._tts_engine = None
+                return
+
         self.logger.log("tts_finished", {"text": text})
+
+    def _init_tts_engine(self):
+        if self._tts_engine is not None:
+            return self._tts_engine
+        try:
+            import pyttsx3
+
+            self._tts_engine = pyttsx3.init()
+            return self._tts_engine
+        except Exception as exc:
+            self.logger.log("tts_error", {"reason": "pyttsx3 init exception", "error": str(exc)})
+            self._tts_engine = None
+            return None
 
     def _stop_tts(self) -> None:
         with self._tts_lock:
@@ -170,6 +232,18 @@ class VoiceController:
         self.logger.log("voice_error", {"stage": "fatal", "error": message})
         self.on_error(message)
         self._stop_event.set()
+
+    def _log_stt_error(self, stage: str, exc: Exception) -> str:
+        err_name = exc.__class__.__name__
+        self.logger.log(
+            "stt_error",
+            {
+                "stage": stage,
+                "error": err_name,
+                "details": str(exc),
+            },
+        )
+        return err_name
 
 
 def sanitize_for_tts(text: str, max_len: int = 500) -> str:
