@@ -37,13 +37,17 @@ class OllamaClient:
         self.model = model
         self.timeout = timeout
 
+        # КЛЮЧЕВО: не брать прокси из окружения (Hiddify / системный proxy)
+        self.session = requests.Session()
+        self.session.trust_env = False
+
     def health_check(self) -> tuple[bool, str]:
         try:
-            requests.head(f"{self.host}/", timeout=3)
+            self.session.head(f"{self.host}/", timeout=3)
             return True, "ok"
         except Exception:
             try:
-                r = requests.get(f"{self.host}/api/tags", timeout=5)
+                r = self.session.get(f"{self.host}/api/tags", timeout=5)
                 if r.ok:
                     return True, "ok"
             except Exception as exc:
@@ -53,8 +57,14 @@ class OllamaClient:
     def plan(self, context_messages: list[dict[str, str]]) -> LLMDecision:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, *context_messages]
         payload = {"model": self.model, "messages": messages, "stream": False}
-        response = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
+
+        response = self.session.post(
+            f"{self.host}/api/chat",
+            json=payload,
+            timeout=self.timeout,
+        )
         response.raise_for_status()
+
         raw = response.json().get("message", {}).get("content", "{}")
         parsed = self._parse_json(raw)
         return LLMDecision.model_validate(parsed)
