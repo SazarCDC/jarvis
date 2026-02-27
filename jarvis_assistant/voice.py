@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -35,74 +37,125 @@ class VoiceController:
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._tts_lock = threading.Lock()
+
+        self._tts_queue: queue.Queue[str | tuple[str, float] | None] = queue.Queue()
+        self._tts_thread: threading.Thread | None = None
+        self._tts_stop = threading.Event()
         self._tts_engine = None
         self._volume_0_1 = self._read_volume_from_env()
+        self._tts_ready = threading.Event()
+        self._tts_watchdog_sec = self._float_env("JARVIS_TTS_WATCHDOG_SEC", 20.0)
 
     def start(self) -> None:
         if self.is_running():
             return
         self._stop_event.clear()
+        self.start_tts()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="voice-loop")
         self._thread.start()
+        self.speak("Голосовой режим включен")
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._stop_tts()
+        self.stop_tts()
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def start_tts(self) -> None:
+        if self._tts_thread and self._tts_thread.is_alive():
+            return
+        self._tts_stop.clear()
+        self._tts_ready.clear()
+        self._tts_thread = threading.Thread(target=self._tts_loop, daemon=True, name="tts-loop")
+        self._tts_thread.start()
+
+    def stop_tts(self) -> None:
+        self._tts_stop.set()
+        self._clear_tts_queue()
+        if self._tts_engine is not None:
+            try:
+                self._tts_engine.stop()
+            except Exception as exc:
+                self.logger.log("tts_error", {"error": str(exc), "stage": "stop"})
+        self._enqueue_tts(None)
+
     def set_volume(self, volume_0_1: float) -> None:
         self._volume_0_1 = min(1.0, max(0.0, float(volume_0_1)))
+        self.start_tts()
+        self._enqueue_tts(("__SET_VOLUME__", self._volume_0_1))
 
     def speak(self, text: str) -> None:
         cleaned = sanitize_for_tts(text)
         if not cleaned or self._stop_event.is_set():
             return
+        self.start_tts()
+        self._enqueue_tts(cleaned)
 
-        self.on_status("Speaking")
-        self.logger.log("tts_started", {"text": cleaned})
+    def _enqueue_tts(self, item: str | tuple[str, float] | None) -> None:
         try:
-            engine = self._init_tts_engine()
-            if engine is None:
-                return
+            self._tts_queue.put_nowait(item)
+        except queue.Full:
+            self.logger.log("tts_error", {"error": "tts_queue_full"})
 
-            with self._tts_lock:
-                if self._stop_event.is_set():
-                    return
-                engine.stop()
-                engine.setProperty("volume", self._volume_0_1)
-                engine.say(cleaned)
+    def _clear_tts_queue(self) -> None:
+        while True:
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
 
-            run_error: Exception | None = None
+    def _tts_loop(self) -> None:
+        engine = None
+        try:
+            import pyttsx3
 
-            def _run_and_wait() -> None:
-                nonlocal run_error
+            engine = pyttsx3.init()
+            engine.setProperty("volume", self._volume_0_1)
+            self._tts_engine = engine
+            self._tts_ready.set()
+
+            while not self._tts_stop.is_set():
+                item = self._tts_queue.get()
+                if item is None:
+                    break
+
+                if isinstance(item, tuple) and item[0] == "__SET_VOLUME__":
+                    try:
+                        engine.setProperty("volume", float(item[1]))
+                    except Exception as exc:
+                        self.logger.log("tts_error", {"error": str(exc), "stage": "set_volume"})
+                    continue
+
+                text = str(item)
+                started_at = time.monotonic()
                 try:
+                    self.on_status("Speaking")
+                    self.logger.log("tts_started", {"text": text[:120]})
+                    engine.stop()
+                    engine.say(text)
                     engine.runAndWait()
-                except Exception as exc:  # pragma: no cover
-                    run_error = exc
-
-            worker = threading.Thread(target=_run_and_wait, daemon=True, name="tts-runner")
-            worker.start()
-
-            while worker.is_alive() and not self._stop_event.is_set():
-                worker.join(timeout=0.1)
-
-            if self._stop_event.is_set() and worker.is_alive():
-                engine.stop()
-                worker.join(timeout=1)
-
-            if run_error is not None:
-                self.logger.log("voice_error", {"stage": "tts", "error": str(run_error)})
-                self.on_error(f"Ошибка синтеза речи: {run_error}")
+                    if time.monotonic() - started_at > self._tts_watchdog_sec:
+                        self.logger.log(
+                            "tts_watchdog_timeout",
+                            {"duration_sec": round(time.monotonic() - started_at, 2), "text": text[:120]},
+                        )
+                    self.logger.log("tts_finished", {"text": text[:120]})
+                except Exception as exc:
+                    self.logger.log("tts_error", {"error": str(exc)})
+                finally:
+                    self.on_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
         except Exception as exc:
-            self.logger.log("voice_error", {"stage": "tts", "error": str(exc)})
+            self.logger.log("tts_error", {"error": str(exc), "stage": "init"})
             self.on_error(f"Ошибка синтеза речи: {exc}")
         finally:
-            self.logger.log("tts_finished", {"text": cleaned})
-            self.on_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
+            self._tts_engine = None
+            self._tts_ready.clear()
+            try:
+                if engine is not None:
+                    engine.stop()
+            except Exception:
+                pass
 
     def _run_loop(self) -> None:
         recorder = None
@@ -251,24 +304,6 @@ class VoiceController:
         if chunk.size == 0:
             return 0.0
         return float(np.sqrt(np.mean(np.square(chunk.astype(np.float32)))))
-
-    def _init_tts_engine(self):
-        if self._tts_engine is not None:
-            return self._tts_engine
-        try:
-            import pyttsx3
-
-            self._tts_engine = pyttsx3.init()
-            return self._tts_engine
-        except Exception as exc:
-            self.logger.log("voice_error", {"stage": "tts_init", "error": str(exc)})
-            self._tts_engine = None
-            return None
-
-    def _stop_tts(self) -> None:
-        with self._tts_lock:
-            if self._tts_engine is not None:
-                self._tts_engine.stop()
 
     @staticmethod
     def _read_volume_from_env() -> float:

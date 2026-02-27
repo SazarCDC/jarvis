@@ -97,6 +97,7 @@ class JarvisApp(tk.Tk):
 
         self.voice_enabled.set(True)
         self.voice_btn.configure(text="Voice: ON")
+        self.voice_controller.start_tts()
         self.voice_controller.start()
         self._append(
             "System",

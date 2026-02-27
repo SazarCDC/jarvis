@@ -58,9 +58,10 @@ python main.py
 - Включается кнопкой `Voice: ON` в верхней панели.
 - Wake word в UI/логах: `джарвис` (детекция через `Picovoice Porcupine` + кастомный `.ppn`).
 - После wake word ассистент говорит «Слушаю», записывает команду с микрофона (до тишины или max 10s) и отправляет её в стандартный текстовый pipeline.
-- Ответ появляется в чате и озвучивается через `pyttsx3`.
+- При включении Voice режима выполняется короткий TTS self-test: «Голосовой режим включен».
+- Ответ появляется в чате и озвучивается через `pyttsx3` (dedicated TTS-thread + очередь сообщений, без блокировки UI).
 - Если ассистент уже выполняет задачу, на wake word он отвечает «Подожди секунду».
-- Кнопка `STOP` останавливает текущий pipeline, voice-listening, текущую запись/транскрипцию и текущую озвучку.
+- Кнопка `STOP` останавливает текущий pipeline, voice-listening, текущую запись/транскрипцию и мгновенно прерывает текущую озвучку (`engine.stop()` + очистка очереди TTS).
 - В UI есть слайдер `TTS Volume` (0..100), который применяется сразу.
 
 ### Voice ENV
@@ -81,6 +82,7 @@ python main.py
 - Wake word не срабатывает: проверь `JARVIS_PICOVOICE_ACCESS_KEY`, путь `JARVIS_PICOVOICE_MODEL_PATH` и качество микрофона.
 - Команда обрезается или не детектится: подстрой `JARVIS_VAD_RMS_THRESHOLD` и `JARVIS_COMMAND_SILENCE_MS`.
 - Voice pipeline полностью оффлайн после получения `Picovoice AccessKey`.
+- Нет звука в TTS: проверь `TTS Volume` в UI, уровень приложения в Windows Volume Mixer и `Default Output Device` (Параметры звука Windows).
 
 ### Wake word (Porcupine)
 
