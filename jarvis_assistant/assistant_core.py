@@ -175,11 +175,12 @@ class JarvisAssistant:
 
         index = self._parse_choice_index(user_text)
         if index is None:
-            if self.pending.get("type") == "choose_recovery_option" and user_text.strip().lower() in {"да", "yes"}:
+            choice_text = user_text.strip().lower()
+            if self.pending.get("type") == "choose_recovery_option" and choice_text in {"да", "yes"}:
                 index = 0
-            elif self.pending.get("type") == "choose_recovery_option" and user_text.strip().lower() in {"нет", "no"}:
+            elif self.pending.get("type") == "choose_recovery_option" and choice_text in {"нет", "no", "0"}:
                 self.pending = None
-                return "Хорошо, отменяю альтернативное действие."
+                return "Хорошо, отменяю действие."
             else:
                 return None
 
@@ -275,6 +276,19 @@ class JarvisAssistant:
                 "Выберите вариант: 1) Edge, 2) браузер по умолчанию."
             )
 
+        if self._is_window_command_recovery_case(first_fail):
+            window_title = self._infer_window_title(user_lower)
+            options = [
+                {"label": "Активировать окно", "action": {"type": "window", "args": {"command": "activate", "title": window_title}}},
+                {"label": "Закрыть окно", "action": {"type": "window", "args": {"command": "close", "title": window_title}}},
+                {"label": "Свернуть окно", "action": {"type": "window", "args": {"command": "minimize", "title": window_title}}},
+                {"label": "Развернуть окно", "action": {"type": "window", "args": {"command": "maximize", "title": window_title}}},
+            ]
+            self.pending = {"type": "choose_recovery_option", "items": options, "created_at": datetime.now().isoformat(timespec="seconds")}
+            return (
+                "Уточните, что сделать с окном: 1) активировать 2) закрыть 3) свернуть 4) развернуть 0) отмена."
+            )
+
         return None
 
     @staticmethod
@@ -289,6 +303,21 @@ class JarvisAssistant:
             if "taskkill" in cmd and "notepad" in cmd:
                 return True
         return False
+
+    @staticmethod
+    def _infer_window_title(user_text: str) -> str:
+        if "блокнот" in user_text:
+            return "Блокнот"
+        if "chrome" in user_text or "хром" in user_text:
+            return "Chrome"
+        return ""
+
+    @staticmethod
+    def _is_window_command_recovery_case(result: ActionResult) -> bool:
+        if result.action_type != "window":
+            return False
+        error_text = (result.error_message or "").lower()
+        return "не указана операция для окна" in error_text or "нужен title или process" in error_text
 
     @staticmethod
     def _is_chrome_open_case(user_text: str, actions: list[ActionSpec], failed: list[ActionResult]) -> bool:

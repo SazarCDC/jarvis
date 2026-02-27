@@ -191,10 +191,33 @@ class ActionExecutor:
 
     @staticmethod
     def _window(action: ActionSpec) -> ActionResult:
-        title = action.args.get("title", "")
-        command = action.args.get("command", "activate")
+        title = str(action.args.get("title", "") or "").strip()
+        process = str(action.args.get("process", "") or "").strip()
+        command = str(action.args.get("command", "") or "").strip().lower()
 
-        if command == "close" and str(title).strip().lower() in {"блокнот", "notepad"}:
+        if not command:
+            return ActionResult(
+                action_type="window",
+                ok=False,
+                error_message="Не указана операция для окна (command). Допустимые: activate/minimize/maximize/close",
+            )
+
+        allowed_commands = {"activate", "minimize", "maximize", "close"}
+        if command not in allowed_commands:
+            return ActionResult(
+                action_type="window",
+                ok=False,
+                error_message="Не указана операция для окна (command). Допустимые: activate/minimize/maximize/close",
+            )
+
+        if command == "close" and not title and not process:
+            return ActionResult(
+                action_type="window",
+                ok=False,
+                error_message="Не указано какое окно закрыть: нужен title или process",
+            )
+
+        if command == "close" and title.lower() in {"блокнот", "notepad"}:
             if gw is not None:
                 windows = gw.getWindowsWithTitle("Блокнот") + gw.getWindowsWithTitle("Notepad")
                 if windows:
@@ -216,6 +239,19 @@ class ActionExecutor:
 
         if gw is None:
             return ActionResult(action_type="window", ok=False, error_message="pygetwindow недоступен")
+
+        if command == "close" and process:
+            process_name = process if process.lower().endswith(".exe") else f"{process}.exe"
+            cp = subprocess.run(f"taskkill /IM {process_name} /F", shell=True, capture_output=True, text=True)
+            return ActionResult(
+                action_type="window",
+                ok=cp.returncode == 0,
+                stdout=cp.stdout,
+                stderr=cp.stderr,
+                exit_code=cp.returncode,
+                error_message=None if cp.returncode == 0 else f"Не удалось закрыть процесс {process_name}",
+            )
+
         windows = gw.getWindowsWithTitle(title)
         if not windows:
             return ActionResult(action_type="window", ok=False, error_message=f"Окно с заголовком '{title}' не найдено")
