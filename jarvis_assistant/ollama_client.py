@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 from pydantic import ValidationError
@@ -28,7 +29,6 @@ ALLOWED_ACTION_TYPES = {
     "browser",
 }
 
-
 SYSTEM_PROMPT = """
 Ты управляющий интеллект ассистента Jarvis.
 Всегда отвечай ТОЛЬКО валидным JSON-объектом без markdown.
@@ -45,27 +45,18 @@ SYSTEM_PROMPT = """
 Правила:
 - Основной язык общения — русский.
 - Следуй языку пользователя: если пользователь пишет по-английски, можно отвечать на английском.
-- Английские термины и короткие фразы допустимы в техническом контексте.
-- НЕ используй китайский или другие нерелевантные языки, если пользователь явно не перешёл на них.
-- Если есть сомнения по языку, используй русский.
-- LLM не исполняет код сама. Только планирует в actions.
-- Для chat/question обычно формируй response, actions опционально.
-- Для action формируй конкретные шаги в actions.
-- Допустимые значения actions[].type: cmd, powershell, launch, search, write_file, read_file, keyboard, mouse, window, screenshot, clipboard, wait, browser.
-- НИКОГДА не используй actions[].type вне списка выше. Значения вроде "tool", "open_settings" и любые другие — запрещены.
-- Пример открытия блокнота: {"intent":"action","thought":"Открываю блокнот","confidence":0.92,"ask_user":null,"response":"Открываю блокнот.","memory_update":null,"actions":[{"type":"launch","path":"notepad.exe","args":{}}]}
-- Для actions[].path ЗАПРЕЩЕНЫ неэкранированные обратные слэши (`\`) в JSON-строках.
-- Допустимые форматы пути:
-  1) короткое имя exe (пример: `chrome.exe`, `notepad.exe`)
-  2) Windows путь с двойными слэшами (пример: `C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe`)
-  3) путь с forward slash (пример: `C:/Program Files/Google/Chrome/Application/chrome.exe`)
-- Пример открытия Chrome: {"intent":"action","thought":"Открываю Chrome","confidence":0.92,"ask_user":null,"response":"Открываю Chrome.","memory_update":null,"actions":[{"type":"launch","path":"chrome.exe","args":{}}]}
-- Пример открытия Блокнота: {"intent":"action","thought":"Открываю блокнот","confidence":0.92,"ask_user":null,"response":"Открываю блокнот.","memory_update":null,"actions":[{"type":"launch","path":"notepad.exe","args":{}}]}
-- Пример открытия параметров: {"intent":"action","thought":"Открываю параметры Windows","confidence":0.91,"ask_user":null,"response":"Открываю параметры.","memory_update":null,"actions":[{"type":"launch","path":"ms-settings:","args":{}}]}
-- Пример запуска команды: {"intent":"action","thought":"Показываю список файлов","confidence":0.86,"ask_user":null,"response":"Сейчас покажу список файлов.","memory_update":null,"actions":[{"type":"cmd","command":"dir","args":{}}]}
+- НЕ используй китайский или другие нерелевантные языки.
+- metadata.datetime уже передаётся во входе. Если спрашивают время/дату, используй его реальное значение и никогда не выводи шаблоны вроде {datetime}.
+- LLM не исполняет код сама. Только планирует actions.
+- Допустимые actions[].type: cmd, powershell, launch, search, write_file, read_file, keyboard, mouse, window, screenshot, clipboard, wait, browser.
+- search = только поиск файлов/папок на диске.
+- browser = интернет/сайты/новости/погода/картинки/поиск в сети.
+- Для запросов "в интернете", "в сети", "погода", "новости", "картинки", "фото" всегда используй browser.
+- Для browser в response пиши voice-friendly фразы без URL (например: "Открываю результаты в браузере.").
+- Для "закрой блокнот" предпочитай window close: {"type":"window","args":{"command":"close","title":"Блокнот"}}.
+- Если нужно принудительно, используй cmd taskkill: {"type":"cmd","command":"taskkill /IM notepad.exe /F","args":{}}.
+- Пример "найди котиков в интернете": {"intent":"action","thought":"Открываю поиск картинок","confidence":0.92,"ask_user":null,"response":"Открываю результаты поиска в браузере.","memory_update":null,"actions":[{"type":"browser","command":"https://duckduckgo.com/?q=котики&iax=images&ia=images","args":{}}]}.
 - Если неуверен, заполни ask_user.
-- Для noise дай человеческий response с просьбой уточнить.
-- Если используешь поиск/интернет, укажи это в response.
 """.strip()
 
 
@@ -75,7 +66,6 @@ class OllamaClient:
         self.model = model
         self.timeout = timeout
 
-        # КЛЮЧЕВО: не брать прокси из окружения (Hiddify / системный proxy)
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -105,7 +95,8 @@ class OllamaClient:
 
         raw = response.json().get("message", {}).get("content", "{}")
         parsed = self._parse_json(raw)
-        normalized = self._normalize_decision_dict(parsed)
+        user_input = self._extract_user_input(context_messages)
+        normalized = self._normalize_decision_dict(parsed, user_input=user_input)
         try:
             return LLMDecision.model_validate(normalized)
         except ValidationError:
@@ -203,7 +194,18 @@ class OllamaClient:
         }
 
     @staticmethod
-    def _normalize_decision_dict(parsed: dict[str, Any]) -> dict[str, Any]:
+    def _extract_user_input(context_messages: list[dict[str, str]]) -> str:
+        if not context_messages:
+            return ""
+        raw = context_messages[-1].get("content", "")
+        try:
+            parsed = json.loads(raw)
+            return str(parsed.get("user_input", ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_decision_dict(parsed: dict[str, Any], user_input: str = "") -> dict[str, Any]:
         normalized = parsed.copy() if isinstance(parsed, dict) else {}
         notes: list[str] = []
 
@@ -243,6 +245,8 @@ class OllamaClient:
                     notes.append("убрал неполное действие")
                     continue
 
+            fixed = OllamaClient._normalize_action_routing(fixed, user_input)
+
             if fixed.get("type") not in ALLOWED_ACTION_TYPES:
                 notes.append("убрал неподдерживаемое действие")
                 continue
@@ -250,19 +254,50 @@ class OllamaClient:
             cleaned_actions.append(fixed)
 
         normalized["actions"] = cleaned_actions
-
         normalized["response"] = OllamaClient._normalize_language_text(normalized.get("response"))
         normalized["ask_user"] = OllamaClient._normalize_language_text(normalized.get("ask_user"))
 
         if notes:
-            note = "Я немного уточнил план действий."
             if not normalized.get("response"):
-                normalized["response"] = note
+                normalized["response"] = "Я немного уточнил план действий."
             if not normalized.get("ask_user") and not cleaned_actions:
                 normalized["ask_user"] = "Уточните, пожалуйста, что именно выполнить."
                 normalized["intent"] = "question"
 
         return normalized
+
+    @staticmethod
+    def _normalize_action_routing(action: dict[str, Any], user_input: str) -> dict[str, Any]:
+        fixed = action.copy()
+        action_type = str(fixed.get("type") or "").lower()
+        command = str(fixed.get("command") or "")
+        command_lower = command.lower().strip()
+        intent_text = user_input.lower()
+
+        if action_type == "launch" and command_lower:
+            if command_lower.startswith("taskkill"):
+                fixed["type"] = "cmd"
+            elif command_lower.startswith("powershell") or " get-" in f" {command_lower}" or " set-" in f" {command_lower}":
+                fixed["type"] = "powershell"
+            elif command_lower.startswith("cmd") or command_lower.startswith("dir") or command_lower.startswith("cd"):
+                fixed["type"] = "cmd"
+
+        if action_type == "search" and OllamaClient._is_web_intent(intent_text):
+            query = quote_plus(user_input.strip())
+            fixed["type"] = "browser"
+            fixed["command"] = f"https://duckduckgo.com/?q={query}"
+
+        if action_type == "launch":
+            target = f"{fixed.get('path') or ''} {fixed.get('command') or ''}".lower()
+            if "chrome" in target and (not fixed.get("path") or fixed.get("path") in {"chrome", "google chrome"}):
+                fixed["path"] = "chrome.exe"
+
+        return fixed
+
+    @staticmethod
+    def _is_web_intent(text: str) -> bool:
+        markers = ["в интернете", "в сети", "на сайте", "погода", "новости", "картинки", "фото"]
+        return any(marker in text for marker in markers)
 
     @staticmethod
     def _normalize_language_text(value: Any) -> str | None:
@@ -273,7 +308,6 @@ class OllamaClient:
         if not text:
             return None
 
-        # Запрещаем нерелевантные CJK-ответы и заменяем их безопасной фразой на русском.
         if any("\u4e00" <= ch <= "\u9fff" for ch in text):
             return "Я отвечу по-русски. Уточните, пожалуйста, запрос."
 
