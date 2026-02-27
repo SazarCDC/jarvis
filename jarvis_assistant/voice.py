@@ -45,6 +45,15 @@ class VoiceController:
         self._volume_0_1 = self._read_volume_from_env()
         self._tts_ready = threading.Event()
         self._tts_watchdog_sec = self._float_env("JARVIS_TTS_WATCHDOG_SEC", 20.0)
+        self._status_lock = threading.Lock()
+        self._current_status = "Idle"
+
+        self._porcupine_sensitivity = min(1.0, max(0.0, self._float_env("JARVIS_PORCUPINE_SENSITIVITY", 0.7)))
+        self._wake_debug = self._int_env("JARVIS_WAKE_DEBUG", 0) == 1
+        self._wake_cooldown_sec = max(0.0, self._float_env("JARVIS_WAKE_COOLDOWN", 1.0))
+        self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 200))
+        self._command_start_timeout = max(0.3, self._float_env("JARVIS_COMMAND_START_TIMEOUT", 2.5))
+        self._selected_device_label = "unknown"
 
     def start(self) -> None:
         if self.is_running():
@@ -53,7 +62,6 @@ class VoiceController:
         self.start_tts()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="voice-loop")
         self._thread.start()
-        self.speak("Голосовой режим включен")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -73,6 +81,7 @@ class VoiceController:
     def stop_tts(self) -> None:
         self._tts_stop.set()
         self._clear_tts_queue()
+        self._enqueue_tts(("__STOP__", 0.0))
         if self._tts_engine is not None:
             try:
                 self._tts_engine.stop()
@@ -127,10 +136,17 @@ class VoiceController:
                         self.logger.log("tts_error", {"error": str(exc), "stage": "set_volume"})
                     continue
 
+                if isinstance(item, tuple) and item[0] == "__STOP__":
+                    try:
+                        engine.stop()
+                    except Exception as exc:
+                        self.logger.log("tts_error", {"error": str(exc), "stage": "stop"})
+                    continue
+
                 text = str(item)
                 started_at = time.monotonic()
                 try:
-                    self.on_status("Speaking")
+                    self._set_status("Speaking")
                     self.logger.log("tts_started", {"text": text[:120]})
                     engine.stop()
                     engine.say(text)
@@ -144,7 +160,7 @@ class VoiceController:
                 except Exception as exc:
                     self.logger.log("tts_error", {"error": str(exc)})
                 finally:
-                    self.on_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
+                    self._set_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
         except Exception as exc:
             self.logger.log("tts_error", {"error": str(exc), "stage": "init"})
             self.on_error(f"Ошибка синтеза речи: {exc}")
@@ -180,11 +196,28 @@ class VoiceController:
             rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 700.0)
             whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
             beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
-            device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", -1)
+            device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
+            available_devices = PvRecorder.get_available_devices()
+            if not available_devices:
+                self.on_error("Wake word недоступен: PvRecorder не нашел ни одного устройства ввода")
+                return
+
+            if device_index != -1 and (device_index < 0 or device_index >= len(available_devices)):
+                self.logger.log(
+                    "voice_error",
+                    {
+                        "stage": "config",
+                        "error": f"JARVIS_AUDIO_DEVICE_INDEX={device_index} out of range, fallback to 0",
+                    },
+                )
+                device_index = 0
+            device_name = "auto" if device_index == -1 else available_devices[device_index]
+            self._selected_device_label = f"{device_index}: {device_name}"
 
             porcupine = pvporcupine.create(
                 access_key=access_key,
                 keyword_paths=[model_path],
+                sensitivities=[self._porcupine_sensitivity],
             )
             recorder = PvRecorder(
                 device_index=device_index,
@@ -194,24 +227,58 @@ class VoiceController:
 
             self.logger.log("wake_backend_selected", {"backend": "porcupine", "model": ".ppn"})
             self.logger.log("voice_started", {})
+            self.logger.log(
+                "voice_wake_config",
+                {
+                    "sensitivity": self._porcupine_sensitivity,
+                    "device_index": device_index,
+                    "device_name": device_name,
+                },
+            )
 
-            self.on_status("Listening")
+
+            self._set_status("Listening")
             recorder.start()
+            last_wake_at = 0.0
+            last_debug_at = 0.0
 
             while not self._stop_event.is_set():
                 pcm = np.array(recorder.read(), dtype=np.int16)
+                now = time.monotonic()
+
+                if self._wake_debug and (now - last_debug_at) >= 2.0:
+                    rms = float(np.mean(np.abs(pcm.astype(np.float32)))) if pcm.size else 0.0
+                    self.logger.log(
+                        "wake_debug",
+                        {
+                            "device_index": device_index,
+                            "device_name": device_name,
+                            "rms_mean_abs": round(rms, 2),
+                        },
+                    )
+                    last_debug_at = now
+
                 result = porcupine.process(pcm)
                 if result < 0:
                     continue
 
-                self.logger.log("wake_word_detected", {"word": "джарвис"})
-                self.on_status("Heard wake word")
+                if now - last_wake_at < self._wake_cooldown_sec:
+                    self.logger.log("wake_word_ignored_cooldown", {"cooldown_sec": self._wake_cooldown_sec})
+                    continue
+                last_wake_at = now
+
+                self.logger.log(
+                    "wake_word_detected",
+                    {"word": "джарвис", "timestamp": time.time(), "sensitivity": self._porcupine_sensitivity},
+                )
+                self._set_status("Heard wake word")
 
                 if self.is_busy():
                     self.speak("Подожди секунду")
                     continue
 
                 self.speak("Слушаю")
+                self._flush_audio(recorder, self._command_pre_roll_ms)
                 command = self._capture_and_transcribe(
                     recorder=recorder,
                     whisper_model=whisper_model,
@@ -219,6 +286,7 @@ class VoiceController:
                     silence_ms=silence_ms,
                     rms_threshold=rms_threshold,
                     beam_size=beam_size,
+                    start_timeout_sec=self._command_start_timeout,
                 )
                 if not command and not self._stop_event.is_set():
                     self.speak("Да?")
@@ -227,7 +295,7 @@ class VoiceController:
                     self.on_user_text(command)
 
                 if not self._stop_event.is_set():
-                    self.on_status("Listening")
+                    self._set_status("Listening")
 
         except Exception as exc:
             self.logger.log("voice_error", {"stage": "voice_loop", "error": str(exc)})
@@ -246,7 +314,7 @@ class VoiceController:
             except Exception as exc:
                 self.logger.log("voice_error", {"stage": "porcupine_close", "error": str(exc)})
             self.logger.log("voice_stopped", {})
-            self.on_status("Idle")
+            self._set_status("Idle")
             if self.on_stopped:
                 self.on_stopped()
 
@@ -258,25 +326,33 @@ class VoiceController:
         silence_ms: int,
         rms_threshold: float,
         beam_size: int,
+        start_timeout_sec: float,
     ) -> str | None:
         max_frames = int((max_sec * 1000) / self.FRAME_MS)
         silence_limit = max(1, int(silence_ms / self.FRAME_MS))
+        start_timeout_frames = max(1, int((start_timeout_sec * 1000) / self.FRAME_MS))
 
         frames: list[np.ndarray] = []
         speech_detected = False
         silent_frames = 0
+        waited_frames = 0
 
         while not self._stop_event.is_set() and len(frames) < max_frames:
             chunk = np.array(recorder.read(), dtype=np.int16)
-            frames.append(chunk)
+            if not speech_detected:
+                waited_frames += 1
 
             rms = self._chunk_rms(chunk)
             is_speech = rms >= rms_threshold
             if is_speech:
                 speech_detected = True
                 silent_frames = 0
+                frames.append(chunk)
             elif speech_detected:
+                frames.append(chunk)
                 silent_frames += 1
+            elif waited_frames >= start_timeout_frames:
+                return None
 
             if speech_detected and silent_frames >= silence_limit:
                 break
@@ -341,6 +417,40 @@ class VoiceController:
         if max_value is not None:
             value = min(max_value, value)
         return value
+
+    def get_wake_status_line(self) -> str:
+        if self._selected_device_label == "unknown":
+            try:
+                from pvrecorder import PvRecorder
+
+                devices = PvRecorder.get_available_devices()
+                if not devices:
+                    self._selected_device_label = "нет устройств"
+                else:
+                    device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
+                    if device_index == -1:
+                        self._selected_device_label = "-1: auto"
+                    elif 0 <= device_index < len(devices):
+                        self._selected_device_label = f"{device_index}: {devices[device_index]}"
+                    else:
+                        self._selected_device_label = f"{device_index}: out_of_range"
+            except Exception:
+                pass
+        return f"Wake: Porcupine (sens={self._porcupine_sensitivity:.2f}, device={self._selected_device_label})"
+
+    def _set_status(self, status: str) -> None:
+        with self._status_lock:
+            if self._current_status == status:
+                return
+            self._current_status = status
+        self.on_status(status)
+
+    def _flush_audio(self, recorder, pre_roll_ms: int) -> None:
+        frames_to_drop = max(0, int(pre_roll_ms / self.FRAME_MS))
+        for _ in range(frames_to_drop):
+            if self._stop_event.is_set():
+                return
+            recorder.read()
 
 
 def sanitize_for_tts(text: str, max_len: int = 500) -> str:

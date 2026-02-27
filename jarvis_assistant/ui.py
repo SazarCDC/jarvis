@@ -99,10 +99,12 @@ class JarvisApp(tk.Tk):
         self.voice_btn.configure(text="Voice: ON")
         self.voice_controller.start_tts()
         self.voice_controller.start()
+        self._append("System", self.voice_controller.get_wake_status_line())
         self._append(
             "System",
             "Voice mode включен (offline): wake=Porcupine(.ppn), stt=faster-whisper",
         )
+        self.voice_controller.speak("Голосовой режим включен")
 
     def on_stop(self) -> None:
         self.assistant.stop()
