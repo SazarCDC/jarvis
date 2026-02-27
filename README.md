@@ -69,6 +69,11 @@ python main.py
 - `JARVIS_PICOVOICE_ACCESS_KEY` (обязательно)
 - `JARVIS_PICOVOICE_MODEL_PATH` (обязательно: путь к кастомному `.ppn` для «джарвис»)
 - `JARVIS_AUDIO_DEVICE_INDEX` (optional: индекс устройства ввода для `PvRecorder`)
+- `JARVIS_PORCUPINE_SENSITIVITY` (default `0.7`, диапазон `0.0..1.0`; выше = чувствительнее, но больше ложных срабатываний)
+- `JARVIS_WAKE_DEBUG` (default `0`; `1` = лог каждые ~2с с device/rms + подробные wake-события)
+- `JARVIS_WAKE_COOLDOWN` (default `1.0`; игнор повторных wake в течение cooldown)
+- `JARVIS_COMMAND_PRE_ROLL_MS` (default `200`; после wake отбрасывает хвост wake/TTS перед записью)
+- `JARVIS_COMMAND_START_TIMEOUT` (default `2.5`; ожидание начала речи после wake)
 - `JARVIS_VAD_RMS_THRESHOLD` (default `700`)
 - `JARVIS_COMMAND_SILENCE_MS` (default `900`)
 - `JARVIS_COMMAND_MAX_SEC` (default `10`)
@@ -96,6 +101,14 @@ python main.py
 ```bash
 python main.py
 ```
+
+Чувствительность wake word можно повысить, например:
+
+```bash
+setx JARVIS_PORCUPINE_SENSITIVITY "0.85"
+```
+
+⚠️ Слишком высокие значения чувствительности могут увеличить количество ложных срабатываний.
 
 ## Архитектура
 
