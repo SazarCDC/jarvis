@@ -43,6 +43,7 @@ class VoiceController:
         self._tts_queue: queue.Queue[str | None] = queue.Queue()
         self._tts_thread: threading.Thread | None = None
         self._tts_stop_event = threading.Event()
+        self._tts_playing_event = threading.Event()
         self._tts_backend: PiperTTS | None = None
         self._volume_0_1 = self._read_volume_from_env()
         self._tts_rate = self._float_env("JARVIS_TTS_RATE", 1.0)
@@ -52,8 +53,18 @@ class VoiceController:
         self._porcupine_sensitivity = min(1.0, max(0.0, self._float_env("JARVIS_PORCUPINE_SENSITIVITY", 0.7)))
         self._wake_debug = self._int_env("JARVIS_WAKE_DEBUG", 0) == 1
         self._wake_cooldown_sec = max(0.0, self._float_env("JARVIS_WAKE_COOLDOWN", 1.0))
-        self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 200))
-        self._command_start_timeout = max(0.3, self._float_env("JARVIS_COMMAND_START_TIMEOUT", 2.5))
+        self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 350))
+        self._command_start_timeout = max(0.3, self._float_env("JARVIS_COMMAND_START_TIMEOUT", 3.5))
+        self._wake_earcon_enabled = self._int_env("JARVIS_WAKE_EARCON", 1) == 1
+        self._wake_earcon_freq = self._float_env("JARVIS_WAKE_EARCON_FREQ", 880.0)
+        self._wake_earcon_ms = self._int_env("JARVIS_WAKE_EARCON_MS", 70, min_value=20, max_value=250)
+        self._wake_earcon_gain = max(0.0, min(1.0, self._float_env("JARVIS_WAKE_EARCON_GAIN", 0.25)))
+        self._wake_post_tts_silence_ms = self._int_env(
+            "JARVIS_WAKE_POST_TTS_SILENCE_MS",
+            120,
+            min_value=0,
+            max_value=800,
+        )
         self._selected_device_label = "unknown"
 
     def start(self) -> None:
@@ -132,6 +143,7 @@ class VoiceController:
                 text = item
                 try:
                     self._set_status("Speaking")
+                    self._tts_playing_event.set()
                     self.logger.log("tts_started", {"text": text[:120]})
                     pcm_bytes, sample_rate = self._tts_backend.synthesize_stream_raw(text)
                     if pcm_bytes is None:
@@ -143,6 +155,7 @@ class VoiceController:
                 except Exception as exc:
                     self.logger.log("tts_error", {"error": str(exc)})
                 finally:
+                    self._tts_playing_event.clear()
                     self._set_status("Listening" if self.is_running() and not self._stop_event.is_set() else "Idle")
         except Exception as exc:
             self.logger.log("tts_error", {"error": str(exc), "stage": "init"})
@@ -171,8 +184,8 @@ class VoiceController:
                 return
 
             command_max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 10.0)
-            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 900, min_value=300, max_value=3000)
-            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 700.0)
+            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1200, min_value=300, max_value=3000)
+            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 350.0)
             whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
             beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
             device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
@@ -256,7 +269,28 @@ class VoiceController:
                     self.speak("Подожди секунду")
                     continue
 
-                self.speak("Слушаю")
+                self.wait_for_tts_idle(timeout_sec=1.5)
+
+                recorder_stopped = False
+                try:
+                    recorder.stop()
+                    recorder_stopped = True
+                except Exception as exc:
+                    self.logger.log("voice_error", {"stage": "recorder_stop", "error": str(exc)})
+
+                if self._wake_earcon_enabled:
+                    self._play_wake_earcon()
+
+                if self._wake_post_tts_silence_ms > 0:
+                    time.sleep(self._wake_post_tts_silence_ms / 1000.0)
+
+                if recorder_stopped:
+                    try:
+                        recorder.start()
+                    except Exception as exc:
+                        self.logger.log("voice_error", {"stage": "recorder_start", "error": str(exc)})
+                        continue
+
                 self._flush_audio(recorder, self._command_pre_roll_ms)
                 command = self._capture_and_transcribe(
                     recorder=recorder,
@@ -423,6 +457,46 @@ class VoiceController:
                 return
             self._current_status = status
         self.on_status(status)
+
+    def wait_for_tts_idle(self, timeout_sec: float = 2.0) -> bool:
+        if timeout_sec <= 0:
+            return not self._tts_playing_event.is_set()
+        deadline = time.monotonic() + timeout_sec
+        while self._tts_playing_event.is_set() and time.monotonic() < deadline:
+            if self._stop_event.is_set():
+                break
+            time.sleep(0.02)
+        return not self._tts_playing_event.is_set()
+
+    def _play_wake_earcon(self) -> None:
+        try:
+            import sounddevice as sd
+
+            sample_rate = 22050
+            duration_sec = self._wake_earcon_ms / 1000.0
+            samples = max(1, int(sample_rate * duration_sec))
+            timeline = np.arange(samples, dtype=np.float32) / float(sample_rate)
+            wave = np.sin(2.0 * np.pi * float(self._wake_earcon_freq) * timeline).astype(np.float32)
+
+            fade_samples = max(1, int(sample_rate * 0.01))
+            fade_samples = min(fade_samples, max(1, samples // 2))
+            if fade_samples > 0:
+                fade = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+                wave[:fade_samples] *= fade
+                wave[-fade_samples:] *= fade[::-1]
+
+            wave *= float(self._wake_earcon_gain)
+            sd.play(wave, sample_rate, blocking=True)
+            self.logger.log(
+                "wake_earcon_played",
+                {
+                    "freq": self._wake_earcon_freq,
+                    "ms": self._wake_earcon_ms,
+                    "gain": self._wake_earcon_gain,
+                },
+            )
+        except Exception as exc:
+            self.logger.log("voice_error", {"stage": "wake_earcon", "error": str(exc)})
 
     def _flush_audio(self, recorder, pre_roll_ms: int) -> None:
         frames_to_drop = max(0, int(pre_roll_ms / self.FRAME_MS))
