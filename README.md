@@ -57,7 +57,7 @@ python main.py
 
 - Включается кнопкой `Voice: ON` в верхней панели.
 - Wake word в UI/логах: `джарвис` (детекция через `Picovoice Porcupine` + кастомный `.ppn`).
-- После wake word ассистент говорит «Слушаю», записывает команду с микрофона (до тишины или max 10s) и отправляет её в стандартный текстовый pipeline.
+- После wake word ассистент подаёт короткий beep (earcon) вместо фразы «Слушаю», затем записывает команду с микрофона (до тишины или max 10s) и отправляет её в стандартный текстовый pipeline. Это уменьшает самоподхват TTS в STT.
 - При включении Voice режима выполняется короткий TTS self-test: «Голосовой режим включен».
 - Ответ появляется в чате и озвучивается через `Piper` (dedicated TTS-thread + очередь сообщений, без блокировки UI).
 - Piper запускается только в режиме RAW STREAM: текст передаётся в `stdin`, PCM 16-bit (`--output_raw`) читается из `stdout` и воспроизводится через `sounddevice`.
@@ -73,10 +73,15 @@ python main.py
 - `JARVIS_PORCUPINE_SENSITIVITY` (default `0.7`, диапазон `0.0..1.0`; выше = чувствительнее, но больше ложных срабатываний)
 - `JARVIS_WAKE_DEBUG` (default `0`; `1` = лог каждые ~2с с device/rms + подробные wake-события)
 - `JARVIS_WAKE_COOLDOWN` (default `1.0`; игнор повторных wake в течение cooldown)
-- `JARVIS_COMMAND_PRE_ROLL_MS` (default `200`; после wake отбрасывает хвост wake/TTS перед записью)
-- `JARVIS_COMMAND_START_TIMEOUT` (default `2.5`; ожидание начала речи после wake)
-- `JARVIS_VAD_RMS_THRESHOLD` (default `700`)
-- `JARVIS_COMMAND_SILENCE_MS` (default `900`)
+- `JARVIS_WAKE_EARCON` (default `1`; `0` = отключить beep после wake)
+- `JARVIS_WAKE_EARCON_FREQ` (default `880.0`; частота beep в Гц)
+- `JARVIS_WAKE_EARCON_MS` (default `70`, clamp `20..250`; длительность beep)
+- `JARVIS_WAKE_EARCON_GAIN` (default `0.25`, clamp `0..1`; громкость beep)
+- `JARVIS_WAKE_POST_TTS_SILENCE_MS` (default `120`, clamp `0..800`; пауза тишины после beep/TTS перед записью)
+- `JARVIS_COMMAND_PRE_ROLL_MS` (default `350`; после wake отбрасывает хвост wake/earcon перед записью)
+- `JARVIS_COMMAND_START_TIMEOUT` (default `3.5`; ожидание начала речи после wake)
+- `JARVIS_VAD_RMS_THRESHOLD` (default `350`)
+- `JARVIS_COMMAND_SILENCE_MS` (default `1200`)
 - `JARVIS_COMMAND_MAX_SEC` (default `10`)
 - `JARVIS_WHISPER_MODEL` (default `small`)
 - `JARVIS_WHISPER_BEAM_SIZE` (default `1`, диапазон `1..3`)
