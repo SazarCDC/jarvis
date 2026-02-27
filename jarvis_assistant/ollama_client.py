@@ -54,6 +54,13 @@ SYSTEM_PROMPT = """
 - Допустимые значения actions[].type: cmd, powershell, launch, search, write_file, read_file, keyboard, mouse, window, screenshot, clipboard, wait, browser.
 - НИКОГДА не используй actions[].type вне списка выше. Значения вроде "tool", "open_settings" и любые другие — запрещены.
 - Пример открытия блокнота: {"intent":"action","thought":"Открываю блокнот","confidence":0.92,"ask_user":null,"response":"Открываю блокнот.","memory_update":null,"actions":[{"type":"launch","path":"notepad.exe","args":{}}]}
+- Для actions[].path ЗАПРЕЩЕНЫ неэкранированные обратные слэши (`\`) в JSON-строках.
+- Допустимые форматы пути:
+  1) короткое имя exe (пример: `chrome.exe`, `notepad.exe`)
+  2) Windows путь с двойными слэшами (пример: `C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe`)
+  3) путь с forward slash (пример: `C:/Program Files/Google/Chrome/Application/chrome.exe`)
+- Пример открытия Chrome: {"intent":"action","thought":"Открываю Chrome","confidence":0.92,"ask_user":null,"response":"Открываю Chrome.","memory_update":null,"actions":[{"type":"launch","path":"chrome.exe","args":{}}]}
+- Пример открытия Блокнота: {"intent":"action","thought":"Открываю блокнот","confidence":0.92,"ask_user":null,"response":"Открываю блокнот.","memory_update":null,"actions":[{"type":"launch","path":"notepad.exe","args":{}}]}
 - Пример открытия параметров: {"intent":"action","thought":"Открываю параметры Windows","confidence":0.91,"ask_user":null,"response":"Открываю параметры.","memory_update":null,"actions":[{"type":"launch","path":"ms-settings:","args":{}}]}
 - Пример запуска команды: {"intent":"action","thought":"Показываю список файлов","confidence":0.86,"ask_user":null,"response":"Сейчас покажу список файлов.","memory_update":null,"actions":[{"type":"cmd","command":"dir","args":{}}]}
 - Если неуверен, заполни ask_user.
@@ -126,7 +133,74 @@ class OllamaClient:
         if raw.startswith("```"):
             raw = raw.strip("`")
             raw = raw.replace("json", "", 1).strip()
-        return json.loads(raw)
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            if "Invalid \\escape" not in str(exc):
+                logger.debug("LLM JSON parsing failed (non-recoverable): %s", exc)
+                return OllamaClient._safe_parse_fallback()
+
+        repaired_raw = OllamaClient._escape_invalid_backslashes_in_json_strings(raw)
+        try:
+            return json.loads(repaired_raw)
+        except json.JSONDecodeError as exc:
+            logger.debug("LLM JSON parsing failed after repair: %s", exc)
+            return OllamaClient._safe_parse_fallback()
+
+    @staticmethod
+    def _escape_invalid_backslashes_in_json_strings(raw: str) -> str:
+        result: list[str] = []
+        in_string = False
+        i = 0
+        length = len(raw)
+
+        while i < length:
+            ch = raw[i]
+
+            if ch == '"':
+                backslash_count = 0
+                j = i - 1
+                while j >= 0 and raw[j] == "\\":
+                    backslash_count += 1
+                    j -= 1
+                if backslash_count % 2 == 0:
+                    in_string = not in_string
+                result.append(ch)
+                i += 1
+                continue
+
+            if in_string and ch == "\\":
+                next_char = raw[i + 1] if i + 1 < length else ""
+                if next_char in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
+                    result.append(ch)
+                    i += 1
+                    continue
+                if next_char == "u" and i + 5 < length and all(c in "0123456789abcdefABCDEF" for c in raw[i + 2 : i + 6]):
+                    result.append(ch)
+                    i += 1
+                    continue
+
+                result.append("\\\\")
+                i += 1
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return "".join(result)
+
+    @staticmethod
+    def _safe_parse_fallback() -> dict[str, Any]:
+        return {
+            "intent": "question",
+            "thought": "Ошибка формата JSON-ответа LLM, нужно уточнение.",
+            "confidence": 0.0,
+            "ask_user": "Я понял команду, но возникла ошибка формата ответа. Уточните, пожалуйста.",
+            "response": "Я понял команду, но возникла ошибка формата ответа. Уточните, пожалуйста.",
+            "memory_update": None,
+            "actions": [],
+        }
 
     @staticmethod
     def _normalize_decision_dict(parsed: dict[str, Any]) -> dict[str, Any]:
