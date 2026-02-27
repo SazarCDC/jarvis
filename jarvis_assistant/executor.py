@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 import webbrowser
 from pathlib import Path
+from typing import Any
 from threading import Event
 
 import pyautogui
@@ -76,10 +78,59 @@ class ActionExecutor:
         return ActionResult(action_type="powershell", ok=cp.returncode == 0, stdout=cp.stdout, stderr=cp.stderr, exit_code=cp.returncode)
 
     @staticmethod
+    def is_probably_command(target: str) -> bool:
+        text = (target or "").strip()
+        if not text:
+            return False
+
+        lower = text.lower()
+        command_prefixes = (
+            "taskkill",
+            "cmd",
+            "powershell",
+            "pwsh",
+            "dir",
+            "cd",
+            "start",
+            "start-process",
+            "get-",
+            "set-",
+            "wmic",
+        )
+        if lower.startswith(command_prefixes):
+            return True
+
+        first_token = shlex.split(text, posix=False)[0].lower() if text else ""
+        if first_token in {"taskkill", "cmd", "powershell", "pwsh", "dir", "cd", "start", "wmic"}:
+            return True
+
+        command_markers = [" /", " && ", " | ", " > "]
+        return any(marker in lower for marker in command_markers)
+
+    @staticmethod
     def _launch(action: ActionSpec) -> ActionResult:
-        target = action.path or action.command or ""
-        os.startfile(target)
-        return ActionResult(action_type="launch", ok=True, paths=[target])
+        target = (action.path or action.command or "").strip()
+        if not target:
+            return ActionResult(action_type="launch", ok=False, error_message="Не указан путь для запуска", data={"error_code": "EMPTY_TARGET"})
+
+        if ActionExecutor.is_probably_command(target):
+            return ActionResult(
+                action_type="launch",
+                ok=False,
+                error_message="Похоже, это командная строка, а не путь к файлу/программе",
+                data={"error_code": "LIKELY_COMMAND_NOT_PATH", "target": target},
+            )
+
+        try:
+            os.startfile(target)
+            return ActionResult(action_type="launch", ok=True, paths=[target])
+        except FileNotFoundError:
+            return ActionResult(
+                action_type="launch",
+                ok=False,
+                error_message=f"Не найдено: {target}",
+                data={"error_code": "FILE_NOT_FOUND", "target": target},
+            )
 
     @staticmethod
     def _search(action: ActionSpec) -> ActionResult:
@@ -140,10 +191,31 @@ class ActionExecutor:
 
     @staticmethod
     def _window(action: ActionSpec) -> ActionResult:
-        if gw is None:
-            return ActionResult(action_type="window", ok=False, error_message="pygetwindow недоступен")
         title = action.args.get("title", "")
         command = action.args.get("command", "activate")
+
+        if command == "close" and str(title).strip().lower() in {"блокнот", "notepad"}:
+            if gw is not None:
+                windows = gw.getWindowsWithTitle("Блокнот") + gw.getWindowsWithTitle("Notepad")
+                if windows:
+                    try:
+                        windows[0].close()
+                        return ActionResult(action_type="window", ok=True, data={"close_method": "window"})
+                    except Exception:
+                        pass
+            cp = subprocess.run("taskkill /IM notepad.exe /F", shell=True, capture_output=True, text=True)
+            return ActionResult(
+                action_type="window",
+                ok=cp.returncode == 0,
+                stdout=cp.stdout,
+                stderr=cp.stderr,
+                exit_code=cp.returncode,
+                data={"close_method": "taskkill"},
+                error_message=None if cp.returncode == 0 else "Не удалось закрыть Блокнот",
+            )
+
+        if gw is None:
+            return ActionResult(action_type="window", ok=False, error_message="pygetwindow недоступен")
         windows = gw.getWindowsWithTitle(title)
         if not windows:
             return ActionResult(action_type="window", ok=False, error_message=f"Окно с заголовком '{title}' не найдено")
@@ -188,6 +260,8 @@ class ActionExecutor:
 
     @staticmethod
     def _browser(action: ActionSpec) -> ActionResult:
-        url = action.command or action.args.get("url") or ""
+        url = (action.command or action.args.get("url") or "").strip()
+        if not url:
+            return ActionResult(action_type="browser", ok=False, error_message="Пустой URL", data={"error_code": "EMPTY_URL"})
         webbrowser.open(url)
         return ActionResult(action_type="browser", ok=True, data={"url": url})
