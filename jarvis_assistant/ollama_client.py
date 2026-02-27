@@ -43,12 +43,18 @@ SYSTEM_PROMPT = """
   "actions": [{"type": "...", "command": "...", "path": "...", "args": {...}}]
 }
 Правила:
+- Основной язык общения — русский.
+- Следуй языку пользователя: если пользователь пишет по-английски, можно отвечать на английском.
+- Английские термины и короткие фразы допустимы в техническом контексте.
+- НЕ используй китайский или другие нерелевантные языки, если пользователь явно не перешёл на них.
+- Если есть сомнения по языку, используй русский.
 - LLM не исполняет код сама. Только планирует в actions.
 - Для chat/question обычно формируй response, actions опционально.
 - Для action формируй конкретные шаги в actions.
 - Допустимые значения actions[].type: cmd, powershell, launch, search, write_file, read_file, keyboard, mouse, window, screenshot, clipboard, wait, browser.
-- НИКОГДА не используй actions[].type вне списка выше. Значения вроде "tool" запрещены.
+- НИКОГДА не используй actions[].type вне списка выше. Значения вроде "tool", "open_settings" и любые другие — запрещены.
 - Пример открытия блокнота: {"intent":"action","thought":"Открываю блокнот","confidence":0.92,"ask_user":null,"response":"Открываю блокнот.","memory_update":null,"actions":[{"type":"launch","path":"notepad.exe","args":{}}]}
+- Пример открытия параметров: {"intent":"action","thought":"Открываю параметры Windows","confidence":0.91,"ask_user":null,"response":"Открываю параметры.","memory_update":null,"actions":[{"type":"launch","path":"ms-settings:","args":{}}]}
 - Пример запуска команды: {"intent":"action","thought":"Показываю список файлов","confidence":0.86,"ask_user":null,"response":"Сейчас покажу список файлов.","memory_update":null,"actions":[{"type":"cmd","command":"dir","args":{}}]}
 - Если неуверен, заполни ask_user.
 - Для noise дай человеческий response с просьбой уточнить.
@@ -107,8 +113,8 @@ class OllamaClient:
                     "intent": "question",
                     "thought": "Нужно уточнение, чтобы выполнить запрос корректно.",
                     "confidence": 0.0,
-                    "ask_user": "Уточни, что именно сделать.",
-                    "response": "Я понял запрос, но мне нужно уточнение, чтобы продолжить.",
+                    "ask_user": "Уточните, пожалуйста, что именно выполнить.",
+                    "response": "Я понял запрос, но мне нужно уточнение.",
                     "memory_update": None,
                     "actions": [],
                 }
@@ -146,6 +152,10 @@ class OllamaClient:
             if action_type == "tool":
                 fixed["type"] = "launch"
                 notes.append("уточнил тип действия")
+            elif action_type == "open_settings":
+                fixed["type"] = "launch"
+                fixed["path"] = "ms-settings:"
+                notes.append("уточнил действие открытия параметров")
             elif not action_type:
                 command = str(fixed.get("command") or "").strip()
                 path = str(fixed.get("path") or "").strip()
@@ -167,12 +177,30 @@ class OllamaClient:
 
         normalized["actions"] = cleaned_actions
 
+        normalized["response"] = OllamaClient._normalize_language_text(normalized.get("response"))
+        normalized["ask_user"] = OllamaClient._normalize_language_text(normalized.get("ask_user"))
+
         if notes:
             note = "Я немного уточнил план действий."
             if not normalized.get("response"):
                 normalized["response"] = note
             if not normalized.get("ask_user") and not cleaned_actions:
-                normalized["ask_user"] = "Уточни, пожалуйста, что именно нужно сделать."
+                normalized["ask_user"] = "Уточните, пожалуйста, что именно выполнить."
                 normalized["intent"] = "question"
 
         return normalized
+
+    @staticmethod
+    def _normalize_language_text(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+
+        text = value.strip()
+        if not text:
+            return None
+
+        # Запрещаем нерелевантные CJK-ответы и заменяем их безопасной фразой на русском.
+        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            return "Я отвечу по-русски. Уточните, пожалуйста, запрос."
+
+        return text
