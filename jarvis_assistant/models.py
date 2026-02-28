@@ -5,7 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-Intent = Literal["chat", "question", "action", "noise"]
+Intent = Literal["chat", "question", "action", "noise", "web", "hybrid"]
+RouteType = Literal["chat", "question", "web-research", "pc-action", "hybrid"]
 ActionType = Literal[
     "cmd",
     "powershell",
@@ -20,6 +21,11 @@ ActionType = Literal[
     "clipboard",
     "wait",
     "browser",
+    "audio",
+    "web_search",
+    "web_fetch",
+    "web_extract",
+    "monitor",
 ]
 
 
@@ -38,6 +44,13 @@ class LLMDecision(BaseModel):
     response: str | None = None
     memory_update: dict[str, Any] | None = None
     actions: list[ActionSpec] = Field(default_factory=list)
+    continue_: int = Field(default=0, alias="continue", ge=0, le=1)
+
+
+class RouterDecision(BaseModel):
+    route: RouteType
+    thought: str = ""
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
 class ActionResult(BaseModel):
@@ -51,3 +64,4 @@ class ActionResult(BaseModel):
     screenshot_path: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
+    error_code: str | None = None
