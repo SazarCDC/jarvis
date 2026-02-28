@@ -87,11 +87,12 @@ class OllamaClient:
         return False, f"Ollama не отвечает по адресу {self.host}."
 
     def route(self, metadata: dict[str, Any]) -> RouterDecision:
-        parsed = self._chat_json(ROUTER_SYSTEM_PROMPT, metadata)
+        parsed = self._chat_json(ROUTER_SYSTEM_PROMPT, metadata, schema=RouterDecision.model_json_schema())
+        normalized = self._normalize_router_dict(parsed)
         try:
-            return RouterDecision.model_validate(parsed)
+            return RouterDecision.model_validate(normalized)
         except ValidationError:
-            return RouterDecision(route="hybrid", thought="fallback", confidence=0.3)
+            return RouterDecision(route="chat", thought="fallback", confidence=0.3)
 
     def chat(self, metadata: dict[str, Any]) -> LLMDecision:
         return self._decision(CHAT_SYSTEM_PROMPT, metadata)
@@ -100,7 +101,7 @@ class OllamaClient:
         return self._decision(AGENT_SYSTEM_PROMPT, metadata)
 
     def _decision(self, prompt: str, metadata: dict[str, Any]) -> LLMDecision:
-        parsed = self._chat_json(prompt, metadata)
+        parsed = self._chat_json(prompt, metadata, schema=LLMDecision.model_json_schema(by_alias=True))
         normalized = self._normalize_decision_dict(parsed)
         try:
             return LLMDecision.model_validate(normalized)
@@ -119,7 +120,7 @@ class OllamaClient:
                 }
             )
 
-    def _chat_json(self, system_prompt: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    def _chat_json(self, system_prompt: str, metadata: dict[str, Any], schema: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": [
@@ -127,6 +128,8 @@ class OllamaClient:
                 {"role": "user", "content": json.dumps(metadata, ensure_ascii=False)},
             ],
             "stream": False,
+            "format": schema or "json",
+            "options": {"temperature": 0},
         }
         response = self.session.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
         response.raise_for_status()
@@ -136,6 +139,10 @@ class OllamaClient:
     @staticmethod
     def _parse_json(raw_text: str) -> dict[str, Any]:
         text = (raw_text or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:].strip()
         try:
             return json.loads(text)
         except Exception:
@@ -154,13 +161,52 @@ class OllamaClient:
         data = parsed if isinstance(parsed, dict) else {}
         actions = data.get("actions") if isinstance(data.get("actions"), list) else []
         cleaned = [a for a in actions if isinstance(a, dict) and a.get("type") in ALLOWED_ACTION_TYPES]
+
+        raw_confidence = data.get("confidence", 0.7)
+        try:
+            confidence = float(raw_confidence)
+        except Exception:
+            confidence = 0.7
+        confidence = max(0.0, min(1.0, confidence))
+
+        raw_continue = data.get("continue", 0)
+        try:
+            continue_value = int(raw_continue)
+        except Exception:
+            continue_value = 0
+        continue_value = 1 if continue_value > 0 else 0
+
+        intent = str(data.get("intent", "question"))
+        if intent not in {"chat", "question", "action", "noise", "web", "hybrid"}:
+            intent = "question"
+
         return {
-            "intent": data.get("intent", "question"),
+            "intent": intent,
             "thought": str(data.get("thought", "")),
-            "confidence": data.get("confidence", 0.7),
+            "confidence": confidence,
             "ask_user": data.get("ask_user"),
             "response": data.get("response"),
             "memory_update": data.get("memory_update"),
             "actions": cleaned,
-            "continue": int(data.get("continue", 0) or 0),
+            "continue": continue_value,
+        }
+
+    @staticmethod
+    def _normalize_router_dict(parsed: dict[str, Any]) -> dict[str, Any]:
+        data = parsed if isinstance(parsed, dict) else {}
+        route = str(data.get("route", "chat"))
+        if route not in {"chat", "question", "web-research", "pc-action", "hybrid"}:
+            route = "chat"
+
+        raw_confidence = data.get("confidence", 0.8)
+        try:
+            confidence = float(raw_confidence)
+        except Exception:
+            confidence = 0.8
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "route": route,
+            "thought": str(data.get("thought", "")),
+            "confidence": confidence,
         }

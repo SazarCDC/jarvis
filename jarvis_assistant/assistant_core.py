@@ -107,6 +107,10 @@ class JarvisAssistant:
             if decision.response:
                 final_reply = decision.response
             if decision.continue_ == 0:
+                if not decision.response and not decision.actions:
+                    if step < CONFIG.agent.max_steps - 1:
+                        continue
+                    return "Я не смог получить корректный ответ от модели. Попробуй переформулировать запрос."
                 self.awaiting_user = False
                 return final_reply
 
