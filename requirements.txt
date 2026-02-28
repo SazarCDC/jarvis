@@ -10,5 +10,5 @@ sounddevice>=0.4.6
 faster-whisper>=1.0.0
 pvporcupine>=3.0.2
 pvrecorder>=1.2.4
-duckduckgo-search>=6.1.8
+ddgs>=8.0.0
 trafilatura>=1.10.0

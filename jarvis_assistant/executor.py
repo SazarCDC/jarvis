@@ -25,9 +25,12 @@ except Exception:
     gw = None
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except Exception:
-    DDGS = None
+    try:
+        from duckduckgo_search import DDGS
+    except Exception:
+        DDGS = None
 
 try:
     import trafilatura
@@ -270,7 +273,7 @@ class ActionExecutor:
         if not CONFIG.web.enabled:
             return ActionResult(action_type="web_search", ok=False, error_message="Web disabled in settings", error_code="WEB_DISABLED")
         if DDGS is None:
-            return ActionResult(action_type="web_search", ok=False, error_message="duckduckgo-search не установлен", error_code="WEB_SEARCH_LIB_MISSING")
+            return ActionResult(action_type="web_search", ok=False, error_message="Библиотека веб-поиска не установлена (установите пакет ddgs)", error_code="WEB_SEARCH_LIB_MISSING")
         query = (action.command or action.args.get("query") or "").strip()
         if not query:
             return ActionResult(action_type="web_search", ok=False, error_message="Пустой query", error_code="EMPTY_QUERY")
