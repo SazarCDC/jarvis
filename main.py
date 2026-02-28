@@ -67,15 +67,15 @@ def main() -> None:
     if not ok:
         raise RuntimeError(message)
 
-    memory = MemoryStore(CONFIG.memory_dir)
-    logger = JsonlLogger(CONFIG.logs_dir / "events.jsonl")
+    memory = MemoryStore(CONFIG.paths.memory_dir)
+    logger = JsonlLogger(CONFIG.paths.log_dir / "events.jsonl")
     assistant = JarvisAssistant(
         llm=llm,
         memory=memory,
         logger=logger,
         stop_event=Event(),
-        max_history_messages=CONFIG.max_history_messages,
-        command_timeout_sec=CONFIG.command_timeout_sec,
+        max_history_messages=CONFIG.agent.max_history,
+        command_timeout_sec=CONFIG.runtime.command_timeout_sec,
     )
 
     app = JarvisApp(assistant=assistant, logger=logger)

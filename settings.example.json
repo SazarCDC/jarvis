@@ -1,0 +1,46 @@
+{
+  "paths": {
+    "memory_dir": "jarvis_assistant/memory",
+    "log_dir": "logs",
+    "tools_dir": "tools",
+    "models_dir": "models",
+    "piper_exe": "tools/piper/piper.exe",
+    "piper_model": "models/ru_RU-denis-medium.onnx",
+    "porcupine_ppn": "models/jarvis.ppn"
+  },
+  "llm": {
+    "ollama_host": "http://127.0.0.1:11434",
+    "ollama_model": "qwen2.5:7b-instruct"
+  },
+  "agent": {
+    "max_steps": 12,
+    "max_history": 20,
+    "followup_seconds": 8,
+    "summary_trigger": 30
+  },
+  "voice": {
+    "device_index": 0,
+    "porcupine_sensitivity": 0.7,
+    "vad_rms_threshold": 300,
+    "command_max_sec": 15,
+    "command_silence_ms": 1400,
+    "command_start_timeout": 6.0,
+    "wake_post_tts_silence_ms": 120,
+    "tts_volume": 80,
+    "tts_rate": 1.0,
+    "whisper_model": "small",
+    "whisper_beam_size": 1,
+    "picovoice_access_key": ""
+  },
+  "web": {
+    "enabled": true,
+    "timeout_sec": 15,
+    "max_results": 5,
+    "region": "ru-ru",
+    "fetch_max_chars": 60000,
+    "extract_max_chars": 12000
+  },
+  "runtime": {
+    "command_timeout_sec": 120
+  }
+}

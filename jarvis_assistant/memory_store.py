@@ -33,10 +33,7 @@ class MemoryStore:
     def get_memory_payload(self) -> dict[str, Any]:
         preferences = self._normalized_preferences(self._load(self.preferences_file))
         self._save(self.preferences_file, preferences)
-        return {
-            "facts": self._load(self.facts_file),
-            "preferences": preferences,
-        }
+        return {"facts": self._load(self.facts_file), "preferences": preferences}
 
     def apply_updates(self, updates: dict[str, Any]) -> None:
         if not updates:
@@ -46,10 +43,8 @@ class MemoryStore:
             facts.update(updates["facts"])
             self._save(self.facts_file, facts)
         if "preferences" in updates and isinstance(updates["preferences"], dict):
-            prefs = self._normalized_preferences(self._load(self.preferences_file))
-            prefs = self._deep_merge_dicts(prefs, updates["preferences"])
-            prefs = self._normalized_preferences(prefs)
-            self._save(self.preferences_file, prefs)
+            prefs = self._deep_merge_dicts(self._normalized_preferences(self._load(self.preferences_file)), updates["preferences"])
+            self._save(self.preferences_file, self._normalized_preferences(prefs))
 
     def set_preference(self, path: list[str], value: Any) -> None:
         if not path:
@@ -57,11 +52,7 @@ class MemoryStore:
         prefs = self._normalized_preferences(self._load(self.preferences_file))
         cursor: dict[str, Any] = prefs
         for key in path[:-1]:
-            existing = cursor.get(key)
-            if not isinstance(existing, dict):
-                existing = {}
-                cursor[key] = existing
-            cursor = existing
+            cursor = cursor.setdefault(key, {}) if isinstance(cursor.get(key, {}), dict) else {}
         cursor[path[-1]] = value
         self._save(self.preferences_file, self._normalized_preferences(prefs))
 
@@ -76,10 +67,23 @@ class MemoryStore:
         return merged
 
     @staticmethod
+    def _clamp01(value: Any, default: float) -> float:
+        try:
+            return min(1.0, max(0.0, float(value)))
+        except Exception:
+            return default
+
+    @staticmethod
     def _normalized_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
         normalized = preferences if isinstance(preferences, dict) else {}
-        app_close_method = normalized.get("app_close_method")
-        if not isinstance(app_close_method, dict):
-            normalized["app_close_method"] = {}
+        normalized.setdefault("app_close_method", {})
         normalized.setdefault("default_browser", "system")
+        voice = normalized.setdefault("voice", {})
+        voice.setdefault("tts_volume_percent", 80)
+        persona = normalized.setdefault("persona", {})
+        persona["friendliness"] = MemoryStore._clamp01(persona.get("friendliness", 0.85), 0.85)
+        persona["humor"] = MemoryStore._clamp01(persona.get("humor", 0.35), 0.35)
+        persona["directness"] = MemoryStore._clamp01(persona.get("directness", 0.55), 0.55)
+        dialogue = normalized.setdefault("dialogue", {})
+        dialogue.setdefault("style", "friendly")
         return normalized

@@ -13,6 +13,7 @@ import numpy as np
 
 from jarvis_assistant.assistant_core import JarvisAssistant
 from jarvis_assistant.logger import JsonlLogger
+from jarvis_assistant.config import CONFIG
 
 
 class VoiceController:
@@ -46,11 +47,13 @@ class VoiceController:
         self._tts_playing_event = threading.Event()
         self._tts_backend: PiperTTS | None = None
         self._volume_0_1 = self._read_volume_from_env()
-        self._tts_rate = self._float_env("JARVIS_TTS_RATE", 1.0)
+        self._followup_seconds = CONFIG.agent.followup_seconds
+        self._last_dialog_ts = 0.0
+        self._tts_rate = CONFIG.voice.tts_rate
         self._status_lock = threading.Lock()
         self._current_status = "Idle"
 
-        self._porcupine_sensitivity = min(1.0, max(0.0, self._float_env("JARVIS_PORCUPINE_SENSITIVITY", 0.7)))
+        self._porcupine_sensitivity = min(1.0, max(0.0, CONFIG.voice.porcupine_sensitivity))
         self._wake_debug = self._int_env("JARVIS_WAKE_DEBUG", 0) == 1
         self._wake_cooldown_sec = max(0.0, self._float_env("JARVIS_WAKE_COOLDOWN", 1.0))
         self._command_pre_roll_ms = max(0, self._int_env("JARVIS_COMMAND_PRE_ROLL_MS", 150))
@@ -61,7 +64,7 @@ class VoiceController:
         self._wake_earcon_gain = max(0.0, min(1.0, self._float_env("JARVIS_WAKE_EARCON_GAIN", 0.25)))
         self._wake_post_tts_silence_ms = self._int_env(
             "JARVIS_WAKE_POST_TTS_SILENCE_MS",
-            120,
+            CONFIG.voice.wake_post_tts_silence_ms,
             min_value=0,
             max_value=800,
         )
@@ -173,22 +176,22 @@ class VoiceController:
             from faster_whisper import WhisperModel
             from pvrecorder import PvRecorder
 
-            access_key = os.getenv("JARVIS_PICOVOICE_ACCESS_KEY", "").strip()
+            access_key = CONFIG.voice.picovoice_access_key.strip()
             if not access_key:
                 self.on_error("Wake word недоступен: не задан JARVIS_PICOVOICE_ACCESS_KEY")
                 return
 
-            model_path = os.getenv("JARVIS_PICOVOICE_MODEL_PATH", "").strip()
+            model_path = str(CONFIG.paths.porcupine_ppn)
             if not model_path or not os.path.isfile(model_path):
                 self.on_error("Wake word недоступен: файл .ppn не найден")
                 return
 
-            command_max_sec = self._float_env("JARVIS_COMMAND_MAX_SEC", 15.0)
-            silence_ms = self._int_env("JARVIS_COMMAND_SILENCE_MS", 1400, min_value=300, max_value=3000)
-            rms_threshold = self._float_env("JARVIS_VAD_RMS_THRESHOLD", 300.0)
-            whisper_model_name = os.getenv("JARVIS_WHISPER_MODEL", "small").strip() or "small"
-            beam_size = self._int_env("JARVIS_WHISPER_BEAM_SIZE", 1, min_value=1, max_value=3)
-            device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
+            command_max_sec = CONFIG.voice.command_max_sec
+            silence_ms = CONFIG.voice.command_silence_ms
+            rms_threshold = CONFIG.voice.vad_rms_threshold
+            whisper_model_name = CONFIG.voice.whisper_model
+            beam_size = CONFIG.voice.whisper_beam_size
+            device_index = CONFIG.voice.device_index
             available_devices = PvRecorder.get_available_devices()
             if not available_devices:
                 self.on_error("Wake word недоступен: PvRecorder не нашел ни одного устройства ввода")
@@ -281,9 +284,25 @@ class VoiceController:
                 )
                 if command:
                     self.logger.log("stt_text", {"text": command})
+                    self._last_dialog_ts = time.time()
                     self.on_user_text(command)
                 elif not self._stop_event.is_set():
                     self.logger.log("stt_empty", {})
+
+                if (self.assistant.awaiting_user or (time.time() - self._last_dialog_ts) <= self._followup_seconds) and not self._stop_event.is_set() and not self.is_busy():
+                    followup = self._capture_and_transcribe(
+                        recorder=recorder,
+                        whisper_model=whisper_model,
+                        max_sec=min(6.0, command_max_sec),
+                        silence_ms=silence_ms,
+                        rms_threshold=rms_threshold,
+                        beam_size=beam_size,
+                        start_timeout_sec=2.0,
+                    )
+                    if followup:
+                        self.logger.log("stt_followup_text", {"text": followup})
+                        self._last_dialog_ts = time.time()
+                        self.on_user_text(followup)
 
                 if not self._stop_event.is_set():
                     self._set_status("Listening")
@@ -418,7 +437,7 @@ class VoiceController:
                 if not devices:
                     self._selected_device_label = "нет устройств"
                 else:
-                    device_index = self._int_env("JARVIS_AUDIO_DEVICE_INDEX", 0)
+                    device_index = CONFIG.voice.device_index
                     if device_index == -1:
                         self._selected_device_label = "-1: auto"
                     elif 0 <= device_index < len(devices):
@@ -516,9 +535,9 @@ class PiperTTS:
         self._piper_process: subprocess.Popen | None = None
         self._process_lock = threading.Lock()
 
-        self._backend = os.getenv("JARVIS_TTS_BACKEND", "piper").strip().lower() or "piper"
-        self._model_path = os.getenv("JARVIS_PIPER_MODEL_PATH", "").strip()
-        self._piper_exe_path = os.getenv("JARVIS_PIPER_EXE_PATH", "").strip()
+        self._backend = "piper"
+        self._model_path = str(CONFIG.paths.piper_model)
+        self._piper_exe_path = str(CONFIG.paths.piper_exe)
         self._available = False
         self._default_sample_rate = 22050
         self._default_sample_rate = self._resolve_sample_rate_from_model_config()
